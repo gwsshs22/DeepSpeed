@@ -53,3 +53,37 @@ class MoEScatter(DSKernelBase):
         """
         self.kernel(moe_input, expert_cumsum, mapped_slots, activations, expert_counts, assignments, offsets)
         return moe_input, expert_cumsum, mapped_slots
+
+class MoEBuildLocalPermuteMapping(DSKernelBase):
+    """
+    CUDA implementation of MoE local permute mapping.
+    """
+
+    supported_dtypes = [DtypeEnum.fp16, DtypeEnum.bf16]
+
+    def __init__(self, dtype: DtypeEnum, channels: int) -> None:
+
+        if not isinstance(dtype, DtypeEnum):
+            dtype = DtypeEnum(dtype)
+
+        if dtype not in MoEBuildLocalPermuteMapping.supported_dtypes:
+            raise RuntimeError(f"Unsupported dtype {dtype}")
+
+        if channels % 8 != 0:
+            raise RuntimeError(f"Channels {channels} must be divisible by 8")
+
+        inf_module = RaggedOpsBuilder().load()
+        self.kernel = inf_module.moe_build_local_permute_mapping
+
+    def __call__(self,
+                 local_assignments: torch.Tensor,
+                 local_offsets: torch.Tensor,
+                 local_expert_cumsum: torch.Tensor,
+                 local_per_expert_cumsum: torch.Tensor,
+                 recv_expert_counts_max: int):
+
+        self.kernel(local_assignments,
+                    local_offsets,
+                    local_expert_cumsum,
+                    local_per_expert_cumsum,
+                    recv_expert_counts_max)

@@ -17,6 +17,8 @@ constexpr int threads = 256;
 constexpr int warps = threads / hw_warp_size;
 constexpr int max_experts = 1024;
 
+// Used in moe_build_local_permute_mapping_kernel
+constexpr int token_per_thread = 8;
 }  // namespace scatter
 
 template <typename T, int copyUnroll, int N_TOP_K>
@@ -214,3 +216,78 @@ INSTANTIATE_SCATTER_FOR_TYPE(__half);
 #ifdef BF16_AVAILABLE
 INSTANTIATE_SCATTER_FOR_TYPE(__nv_bfloat16);
 #endif
+
+
+__global__ void moe_build_local_permute_mapping_kernel(
+    int32_t* local_assignments,
+    int32_t* local_offsets,
+    const int64_t* local_expert_cumsum,
+    const int64_t* local_per_expert_cumsum,
+    const int32_t local_expert_counts_max,
+    const int32_t n_local_experts
+) {
+  const int32_t tbidx = blockIdx.x;
+  const int32_t ep_rank = blockIdx.y;
+  const int32_t expert_rank = blockIdx.z;
+  const int32_t tidx = threadIdx.x;
+
+  const int32_t offset_in_expert_cumsum = ep_rank * n_local_experts + expert_rank;
+  int64_t start_idx;
+  if (ep_rank == 0 && expert_rank == 0) {
+    start_idx = 0;
+  } else {
+    start_idx = *(local_expert_cumsum + offset_in_expert_cumsum - 1);
+  }
+  int64_t end_idx = *(local_expert_cumsum + offset_in_expert_cumsum);
+
+  int32_t start_expert_offset = 0;
+  if (ep_rank > 0) {
+    start_expert_offset = *(local_per_expert_cumsum + (ep_rank - 1) * n_local_experts + expert_rank);
+  }
+
+  int64_t idx = start_idx + tbidx * (scatter::threads * scatter::token_per_thread) + tidx;
+  int64_t offset = start_expert_offset + tbidx * (scatter::threads * scatter::token_per_thread) + tidx;
+
+#pragma unroll
+  for (int64_t i = 0; i < scatter::token_per_thread; i++) {
+    
+    if (idx >= end_idx) {
+      return;
+    }
+
+    *(local_assignments + idx) = expert_rank;
+    *(local_offsets + idx) = offset;
+
+    idx += scatter::threads;
+    offset += scatter::threads;
+  }
+}
+
+void launch_moe_build_local_permute_mapping(
+    int32_t* local_assignments,
+    int32_t* local_offsets,
+    const int64_t* local_expert_cumsum,
+    const int64_t* local_per_expert_cumsum,
+    const int32_t local_expert_counts_max,
+    const int32_t ep_size,
+    const int32_t n_local_experts,
+    cudaStream_t stream
+) {
+  const dim3 block(scatter::threads);
+
+  constexpr int32_t tokens_per_block = scatter::threads * scatter::token_per_thread;
+  const int32_t num_blocks = (local_expert_counts_max + tokens_per_block - 1) / tokens_per_block;
+  const dim3 grid(num_blocks, ep_size, n_local_experts);
+
+  if (num_blocks <= 0) {
+    return;
+  }
+
+  moe_build_local_permute_mapping_kernel<<<grid, block, 0, stream>>>(
+    local_assignments,
+    local_offsets,
+    local_expert_cumsum,
+    local_per_expert_cumsum,
+    local_expert_counts_max,
+    n_local_experts);
+}

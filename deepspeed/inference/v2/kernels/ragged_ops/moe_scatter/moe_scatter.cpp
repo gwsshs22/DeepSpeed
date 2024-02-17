@@ -65,3 +65,35 @@ void moe_scatter(torch::Tensor& moe_input,
 
     TORCH_CHECK(false, "Unsupported dtype for moe_scatter")
 }
+
+
+void moe_build_local_permute_mapping(torch::Tensor& local_assignments,
+                                     torch::Tensor& local_offsets,
+                                     torch::Tensor& local_expert_cumsum,
+                                     torch::Tensor& local_per_expert_cumsum,
+                                     int32_t local_expert_counts_max) {
+  
+  const int32_t n_tokens = local_assignments.size(0);
+  const int32_t ep_size = local_expert_cumsum.size(0);
+  const int32_t n_local_experts = local_expert_cumsum.size(1);
+
+  TORCH_CHECK(local_assignments.size(0) == n_tokens);
+  TORCH_CHECK(ep_size == local_per_expert_cumsum.size(0));
+  TORCH_CHECK(n_local_experts == local_per_expert_cumsum.size(1));
+
+  TORCH_CHECK(local_assignments.scalar_type() == torch::kInt32);
+  TORCH_CHECK(local_offsets.scalar_type() == torch::kInt32);
+  TORCH_CHECK(local_expert_cumsum.scalar_type() == torch::kInt64);
+  TORCH_CHECK(local_per_expert_cumsum.scalar_type() == torch::kInt64);
+
+  launch_moe_build_local_permute_mapping(
+    (int32_t*)local_assignments.data_ptr(),
+    (int32_t*)local_offsets.data_ptr(),
+    (const int64_t*)local_expert_cumsum.data_ptr(),
+    (const int64_t*)local_per_expert_cumsum.data_ptr(),
+    (const int32_t)local_expert_counts_max,
+    ep_size,
+    n_local_experts,
+    at::cuda::getCurrentCUDAStream()
+  );
+}

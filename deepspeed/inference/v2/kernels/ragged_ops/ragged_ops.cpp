@@ -38,10 +38,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gather_for_logits", &gather_for_logits, "Sparse gather from ragged batch");
 
     // moe_gather.h
-    m.def("moe_gather", &moe_gather, "MoE gather for top-1-gating.");
+    m.def("moe_gather", &moe_gather, "MoE gather for top-k-gating.");
 
     // moe_scatter.h
-    m.def("moe_scatter", &moe_scatter, "MoE scatter for top-1-gating.");
+    m.def("moe_scatter", &moe_scatter, "MoE scatter for top-k-gating.");
+    m.def("moe_build_local_permute_mapping", &moe_build_local_permute_mapping, "Prepare mapping for local permute");
 
     // top_k_gating.h
     m.def("top_k_gating", &top_k_gating, "Top-1 gating for MoE with ragged batch awareness.");

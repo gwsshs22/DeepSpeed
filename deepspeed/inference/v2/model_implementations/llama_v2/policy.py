@@ -13,7 +13,7 @@ from .model import Llama2InferenceModel
 
 class Llama2Policy(InferenceV2Policy):
 
-    def instantiate_model(self, engine_config: RaggedInferenceEngineConfig, mp_group: Any) -> Llama2InferenceModel:
+    def instantiate_model(self, engine_config: RaggedInferenceEngineConfig, mp_group: Any, ep_group: Any) -> Llama2InferenceModel:
         return Llama2InferenceModel(config=self._model_config, engine_config=engine_config, base_mp_group=mp_group)
 
     def build_container_map(self) -> ContainerMap:

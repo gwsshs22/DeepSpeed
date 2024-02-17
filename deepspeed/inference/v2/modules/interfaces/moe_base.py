@@ -71,7 +71,8 @@ class DSMoEBase(DSModuleBase):
                 mlp_1_w: torch.Tensor,
                 mlp_2_w: torch.Tensor,
                 mlp_1_b: Optional[torch.Tensor] = None,
-                mlp_2_b: Optional[torch.Tensor] = None) -> torch.Tensor:
+                mlp_2_b: Optional[torch.Tensor] = None,
+                ep_group: Any = None) -> torch.Tensor:
         raise NotImplementedError()
 
     @property

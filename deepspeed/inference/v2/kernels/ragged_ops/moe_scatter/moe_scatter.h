@@ -21,3 +21,9 @@ void moe_scatter(torch::Tensor& moe_input,
                  torch::Tensor& expert_counts,
                  torch::Tensor& assignments,
                  torch::Tensor& offsets);
+
+void moe_build_local_permute_mapping(torch::Tensor& local_assignments,
+                                     torch::Tensor& local_offsets,
+                                     torch::Tensor& local_expert_cumsum,
+                                     torch::Tensor& local_per_expert_cumsum,
+                                     int local_expert_counts_max);

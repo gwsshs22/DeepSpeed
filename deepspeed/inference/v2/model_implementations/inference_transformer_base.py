@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 
 from deepspeed.accelerator import get_accelerator
+import deepspeed.comm as dist
 from ..config_v2 import RaggedInferenceEngineConfig
 from ..inference_utils import ActivationType, ceil_div, is_gated
 from ..model_implementations import *
@@ -555,11 +556,51 @@ class DSMoETransformerModelBase(DSTransformerModelBase):
         """
         raise NotImplementedError("Attempted to access an unimplemented normalization flag")
 
+    @property
+    def ep_enabled(self) -> bool:
+        return self._engine_config.expert_parallel.enabled
+
+    @cached_property
+    def ep_rank(self) -> int:
+        """
+        The rank of the current process.
+
+        # TODO(cmikeh2): Kind of a hack right now, but this is too verbose to use at
+        the frequency we need.
+        """
+        return dist.get_rank(group=self._base_ep_group)
+
+    @cached_property
+    def ep_size(self) -> int:
+        """
+        The total number of processes.
+
+        # TODO(cmikeh2): Kind of a hack right now, but this is too verbose to use at
+        the frequency we need.
+        """
+        return dist.get_world_size(group=self._base_ep_group)
+
+    @cached_property
+    def n_local_experts(self) -> int:
+        return max(1, self.n_experts // self.ep_size)
+
+    @cached_property
+    def expert_tp_degree(self) -> int:
+        return max(1, self.ep_size // self.n_experts)
+
+    def __init__(self, config: DSModelImplementationConfig, engine_config: RaggedInferenceEngineConfig,
+                 base_mp_group: MPType, base_ep_group: MPType) -> None:
+        super().__init__(config, engine_config, base_mp_group)
+        self._base_ep_group = base_ep_group
+
     def make_moe_layer(self) -> None:
         """
         Instantiates the MoE layer for the model. This sets the `self.moe` attribute.
         """
-        sharded_dim = sharded_intermediate_dim(self.intermediate_dim, self.tp_size, self.tp_rank)
+        if self.ep_enabled:
+            sharded_dim = self.intermediate_dim // self.expert_tp_degree
+        else:
+            sharded_dim = sharded_intermediate_dim(self.intermediate_dim, self.tp_size, self.tp_rank)
 
         moe_config = DSMoEConfig(
             max_tokens=self._engine_config.state_manager.max_ragged_batch_size,
@@ -571,6 +612,8 @@ class DSMoETransformerModelBase(DSTransformerModelBase):
             input_dtype=self.activation_dtype,
             output_dtype=self.activation_dtype,
             normalize_scores=self.normalize_expert_scores,
+            enable_ep=self._engine_config.expert_parallel.enabled,
+            ep_size=self.ep_size,
         )
 
         self.moe = heuristics.instantiate_moe(moe_config, self._engine_config)
@@ -594,7 +637,16 @@ class DSMoETransformerModelBase(DSTransformerModelBase):
         Args:
             param (torch.Tensor): The parameter to transform. This should have shape (n_experts, out_neurons, in_neurons).
         """
-        param = shard_mlp_1_param(param, self.tp_rank, self.tp_size, gated=self.gated_mlp, is_moe=True)
+
+        if self.ep_enabled:
+            expert_tp_rank = self.ep_rank // self.n_experts
+            param = shard_mlp_1_param(param, expert_tp_rank, self.expert_tp_degree, gated=self.gated_mlp, is_moe=True)
+            ep_rank_in_tp_group = self.ep_rank % self.n_experts
+            expert_start_id = ep_rank_in_tp_group * self.n_local_experts
+            expert_end_id = (ep_rank_in_tp_group + 1) * self.n_local_experts
+            param = param[expert_start_id:expert_end_id]
+        else:
+            param = shard_mlp_1_param(param, self.tp_rank, self.tp_size, gated=self.gated_mlp, is_moe=True)
 
         return self.moe.transform_moe_mlp_1_param(param)
 
@@ -609,7 +661,16 @@ class DSMoETransformerModelBase(DSTransformerModelBase):
         Args:
             param (torch.Tensor): The parameter to transform. This should have shape (n_experts, out_neurons, in_neurons).
         """
-        param = shard_mlp_2_param(param, self.tp_rank, self.tp_size, is_moe=True)
+
+        if self.ep_enabled:
+            expert_tp_rank = self.ep_rank // self.n_experts
+            param = shard_mlp_2_param(param, expert_tp_rank, self.expert_tp_degree, is_moe=True)
+            ep_rank_in_tp_group = self.ep_rank % self.n_experts
+            expert_start_id = ep_rank_in_tp_group * self.n_local_experts
+            expert_end_id = (ep_rank_in_tp_group + 1) * self.n_local_experts
+            param = param[expert_start_id:expert_end_id]
+        else:
+            param = shard_mlp_2_param(param, self.tp_rank, self.tp_size, is_moe=True)
 
         if param is not None:
             param = self.moe.transform_moe_mlp_2_param(param)

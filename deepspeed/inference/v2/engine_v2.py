@@ -75,12 +75,16 @@ class InferenceEngineV2:
             engine_config (RaggedInferenceEngineConfig): Configuration for the inference engine.
         """
         self._config = engine_config
+
+        if self._config.expert_parallel.enabled:
+            assert self._config.tensor_parallel.tp_size == 1, "TP + EP is currently not supported"
+
         self._policy = policy
-        self._base_mp_group = self._initialize_tp_group()
+        self._base_mp_group, self._base_ep_group = self._initialize_comm_groups()
 
         # Build model from policy
         inference_logger().info("Building model...")
-        self._model = self._policy.build_model(self._config, self._base_mp_group)
+        self._model = self._policy.build_model(self._config, self._base_mp_group, self._base_ep_group)
         inference_logger().info("Model built.")
 
         # Create state manager
@@ -90,19 +94,32 @@ class InferenceEngineV2:
                                              base_mp_group=self._base_mp_group)
         self._model.set_state_manager(self._state_manager)
 
-    def _initialize_tp_group(self):
+    def _initialize_comm_groups(self):
         """
         Implementation of our TP group initialization.
         """
         init_distributed()
         local_rank = int(os.getenv("LOCAL_RANK", 0))
+        tp_size = self._config.tensor_parallel.tp_size
         get_accelerator().set_device(local_rank)
 
-        if local_rank >= self._config.tensor_parallel.tp_size:
-            raise RuntimeError("Local rank is greater than TP size, ensure that the TP config is correct.")
+        if self._config.expert_parallel.enabled:
+            rank = int(os.getenv("RANK", 0))
+            replica_rank = rank // tp_size
+            replica_num = self._config.expert_parallel.replica_num
 
-        ranks = list(range(self._config.tensor_parallel.tp_size))
-        return dist.new_group(ranks=ranks)
+            for i in range(replica_num):
+                ranks = list(range(i * tp_size, (i + 1) * tp_size))
+                group = dist.new_group(ranks=ranks)
+                if replica_rank == i:
+                    tp_group = group
+            return tp_group, dist.new_group(list(range(tp_size * replica_num)))
+        else:
+            if local_rank >= tp_size:
+                raise RuntimeError("Local rank is greater than TP size, ensure that the TP config is correct.")
+
+            ranks = list(range(tp_size))
+            return dist.new_group(ranks=ranks), None
 
     def put(self,
             batch_uids: Iterable[int],
@@ -266,3 +283,6 @@ class InferenceEngineV2:
 
         if self._model.tp_rank == 0:
             pickle.dump(self._model._config, open(os.path.join(save_path, "ds_model_config.pkl"), "wb"))
+
+    def empty_run(self) -> None:
+        self._model.empty_run()

@@ -8,10 +8,12 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from deepspeed.accelerator import get_accelerator
+import deepspeed.comm as dist
 from ....allocator import empty_from
 from ....inference_utils import ActivationType, is_gated
 from ....kernels.core_ops import BlasLibLinear, CUDAGatedActivation
 from ....kernels.ragged_ops import (
+    MoEBuildLocalPermuteMapping,
     MoEGather,
     MoEScatter,
     RaggedTopKGating,
@@ -25,14 +27,14 @@ from ....inference_parameter import InferenceParameter
 
 
 @DSMoERegistry.register_module
-class DSMultiGemmMoE(DSMoEBase):
+class DSMultiGemmMoEEp(DSMoEBase):
     """
-    MoE implementation based on the CUTLASS multi-GEMM.
+    MoE implementation based on the CUTLASS multi-GEMM with expert parallelism.
     """
 
     @staticmethod
     def name():
-        return 'cutlass_multi_gemm_moe'
+        return 'cutlass_multi_gemm_moe_ep'
 
     @staticmethod
     def supports_config(config: DSMoEConfig) -> bool:
@@ -52,7 +54,10 @@ class DSMultiGemmMoE(DSMoEBase):
 
         # Convenience variables for frequently accessed items.
         self.max_tokens = self._config.max_tokens
+        self.ep_size = self._config.ep_size
         self.n_experts = self._config.n_experts
+        self.n_local_experts = max(1, self.n_experts // self.ep_size)
+        self.expert_tp_degree = max(1, self.ep_size // self.n_experts)
         self.n_top_k = self._config.top_k
         self.intermediate_dim = self._config.intermediate_features
 
@@ -70,6 +75,7 @@ class DSMultiGemmMoE(DSMoEBase):
         self._gate_proj = BlasLibLinear(self._config.input_dtype)
         self._top_k_gate = RaggedTopKGating(config.input_dtype)
         self._moe_scatter = MoEScatter(config.input_dtype, config.model_dim)
+        self._moe_build_local_permute_mapping = MoEBuildLocalPermuteMapping(config.input_dtype, config.model_dim)
         self._moe_gather = MoEGather(config.input_dtype, config.model_dim, config.normalize_scores)
 
         self._create_buffers()
@@ -162,65 +168,63 @@ class DSMultiGemmMoE(DSMoEBase):
 
     def _gate(self, hidden_states: torch.Tensor, batch_metadata: RaggedBatchWrapper,
               gate_w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Helper function to isolate the logit for gating. This will take the hidden states
-        and produce the metadata + tensors for the CUTLASS ragged GEMMs. If the input has
-        been padded for CG, this will strip the padding for MoE.
-
-        Parameters:
-            hidden_states (torch.Tensor): Hidden states tensor. Expected shape is [n_tokens, model_dim].
-            batch_metadata (RaggedBatchWrapper): Batch metadata for the hidden states.
-            gate_w (torch.Tensor): Gate weight tensor. Expected shape is [num_experts, model_dim].
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: The MoE input, the cumsum of the offsets (for the MoE kernels themselves), the scores, and the mapped slots (to recover the original order of the tokens)
-        """
-
         # Get views on the buffers for gating
         logits = empty_from(self._logits, (hidden_states.shape[0], self._logits.shape[-1]))
         scores = empty_from(self._scores, (hidden_states.shape[0], self.n_top_k))
         assignments = empty_from(self._assignments, (hidden_states.shape[0], self.n_top_k))
         offsets = empty_from(self._offsets, (hidden_states.shape[0], self.n_top_k))
-        mapped_slots = empty_from(self._mapped_slots, (hidden_states.shape[0], self.n_top_k))
-        moe_input = empty_from(self._moe_input, (hidden_states.shape[0] * self.n_top_k, self._moe_input.shape[-1]))
 
         self._gate_proj(logits, hidden_states, gate_w)
         self._expert_counts.zero_()
         self._top_k_gate(self._expert_counts, scores, assignments, offsets, logits, batch_metadata)
-        self._moe_scatter(moe_input, self._expert_cumsum, mapped_slots, hidden_states, self._expert_counts,
-                          assignments, offsets)
 
-        return moe_input, self._expert_cumsum, scores, mapped_slots
+        return self._expert_cumsum, scores, assignments, offsets
 
-    def forward(self,
-                hidden_states: torch.Tensor,
-                batch_metadata: RaggedBatchWrapper,
-                gate_w: torch.Tensor,
-                mlp_1_w: torch.Tensor,
-                mlp_2_w: torch.Tensor,
-                mlp_1_b: Optional[torch.Tensor] = None,
-                mlp_2_b: Optional[torch.Tensor] = None,
-                ep_group: Any = None) -> torch.Tensor:
-        """
-        MoE forward pass built on top of CUTLASS multi-GEMM.
+    def _prepare_local_permute(self, recv_expert_counts, total_recv_tokens):
+        recv_expert_cumsum = recv_expert_counts.reshape(-1).cumsum(-1).reshape(*recv_expert_counts.shape)
+        recv_per_expert_cumsum = recv_expert_counts.cumsum(0)
 
-        Parameters:
-            hidden_states (torch.Tensor): Hidden states tensor. Expected shape is [batch, seq_len, model_dim].
-            gate_w (torch.Tensor): Gate weight tensor. Expected shape is [num_experts, model_dim].
-        """
+        # TODO(gwkim): We may need to use preallocated buffer
+        local_assignments = torch.empty(
+            (total_recv_tokens, 1),
+            dtype=torch.int32,
+            device=recv_expert_counts.device)
+        local_offsets = torch.empty(
+            (total_recv_tokens, 1),
+            dtype=torch.int32,
+            device=recv_expert_counts.device)
 
-        moe_input, expert_cumsum, scores, mapped_slots = self._gate(hidden_states, batch_metadata, gate_w)
+        recv_expert_counts_max = recv_expert_counts.max().item()
+
+        self._moe_build_local_permute_mapping(
+            local_assignments,
+            local_offsets,
+            recv_expert_cumsum,
+            recv_per_expert_cumsum,
+            recv_expert_counts_max)
+
+        local_expert_counts = recv_expert_counts.sum(0, dtype=torch.int32)
+        return local_expert_counts, local_assignments, local_offsets
+
+    def _run_mlp(self,
+                 moe_input,
+                 mlp_1_w,
+                 mlp_2_w,
+                 mlp_1_b,
+                 mlp_2_b,
+                 expert_cumsum):
+        if moe_input.shape[0] == 0:
+            return moe_input
 
         # Get views on the buffers for GEMM
         intermediate = empty_from(self._intermediate,
-                                  (hidden_states.shape[0] * self.n_top_k, self._intermediate.shape[-1]))
+                                  (moe_input.shape[0], self._intermediate.shape[-1]))
         output_unordered = empty_from(self._output_unordered,
-                                      (hidden_states.shape[0] * self.n_top_k, self._output_unordered.shape[-1]))
-        output = empty_from(self._output, (hidden_states.shape[0], self._output.shape[-1]))
+                                      (moe_input.shape[0], self._output_unordered.shape[-1]))
 
         if self._activation is not None:
             gated_intermediate = empty_from(
-                self._gated_intermediate, (hidden_states.shape[0] * self.n_top_k, self._gated_intermediate.shape[-1]))
+                self._gated_intermediate, (moe_input.shape[0], self._gated_intermediate.shape[-1]))
             self._mlp_1(
                 gated_intermediate,
                 moe_input,
@@ -246,5 +250,122 @@ class DSMultiGemmMoE(DSMoEBase):
             mlp_2_b,
         )
 
-        self._moe_gather(output, output_unordered, scores, mapped_slots, self._expert_counts)
-        return output
+        return output_unordered
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                batch_metadata: RaggedBatchWrapper,
+                gate_w: torch.Tensor,
+                mlp_1_w: torch.Tensor,
+                mlp_2_w: torch.Tensor,
+                mlp_1_b: Optional[torch.Tensor] = None,
+                mlp_2_b: Optional[torch.Tensor] = None,
+                ep_group: Any = None) -> torch.Tensor:
+        empty_run = hidden_states is None
+
+        if not empty_run:    
+            expert_cumsum, scores, assignments, offsets = self._gate(hidden_states, batch_metadata, gate_w)
+
+            mapped_slots = empty_from(self._mapped_slots, (hidden_states.shape[0], self.n_top_k))
+            moe_input = empty_from(self._moe_input, (hidden_states.shape[0] * self.n_top_k, self._moe_input.shape[-1]))
+        else:
+            self._expert_counts.zero_()
+            moe_input = torch.empty(0, self._moe_input.shape[-1], device=self._moe_input.device, dtype=self._moe_input.dtype)
+
+        # Implementation adopted from https://github.com/stanford-futuredata/megablocks/blob/main/megablocks/layers/moe.py.
+        # 1. All-to-all recv/send token counts.
+        send_expert_counts = self._expert_counts.reshape(-1, self.n_local_experts).repeat(self.expert_tp_degree, 1)
+        # TODO(gwkim): We may need to use preallocated buffer
+        recv_expert_counts = torch.empty_like(send_expert_counts)
+
+        a2a_handle_1 = dist.all_to_all_single(
+            recv_expert_counts,
+            send_expert_counts,
+            async_op=True,
+            group=ep_group
+        )
+
+        # 2. First scatter tokens before communicating tokens.
+        if not empty_run:
+            self._moe_scatter(moe_input, self._expert_cumsum, mapped_slots, hidden_states, self._expert_counts,
+                            assignments, offsets)
+
+        a2a_handle_1.wait()
+
+        # Repeat tokens for expert tensor parallelism
+        send_expert_counts_per_rank = send_expert_counts.cpu().sum(dim=-1).tolist()
+
+        recv_expert_counts_cpu = recv_expert_counts.cpu()
+        recv_expert_counts_per_rank = recv_expert_counts_cpu.sum(dim=-1).tolist()
+
+        total_recv_tokens = sum(recv_expert_counts_per_rank)
+
+        repeated_moe_input = moe_input.repeat(self.expert_tp_degree, 1)
+        shuffled_moe_input = torch.empty(
+            (total_recv_tokens,) + repeated_moe_input.shape[1:],
+            device=repeated_moe_input.device, dtype=repeated_moe_input.dtype)
+
+
+        a2a_handle_2 = dist.all_to_all_single(
+            shuffled_moe_input,
+            repeated_moe_input,
+            output_split_sizes=recv_expert_counts_per_rank,
+            input_split_sizes=send_expert_counts_per_rank,
+            group=ep_group,
+            async_op=True
+        )
+
+        # 3. Prepare local permute. We need local permute as tokens from different ranks are grouped by experts in contiguous chunks.
+        local_expert_counts, local_assignments, local_offsets = self._prepare_local_permute(recv_expert_counts, total_recv_tokens)
+
+        local_expert_cumsum = torch.zeros_like(local_expert_counts, dtype=torch.int64)
+        local_scores = torch.ones((total_recv_tokens, 1), device=recv_expert_counts.device)
+        local_mapped_slots = torch.empty(
+            (total_recv_tokens, 1),
+            device=self._mapped_slots.device,
+            dtype=self._mapped_slots.dtype
+        )
+
+        permuted_moe_input = torch.empty_like(shuffled_moe_input)
+        a2a_handle_2.wait()
+
+        if total_recv_tokens > 0:
+            # 4. Do local permute on shuffled_moe_input.
+            self._moe_scatter(permuted_moe_input, local_expert_cumsum, local_mapped_slots, shuffled_moe_input, local_expert_counts,
+                            local_assignments, local_offsets)
+
+            # 5. Compute expert layers with permuted input.
+            permuted_output_unordered = self._run_mlp(
+                permuted_moe_input,
+                mlp_1_w,
+                mlp_2_w,
+                mlp_1_b,
+                mlp_2_b,
+                local_expert_cumsum
+            )
+
+            # 6. Do local unpermute with permuted_output_unordered.
+            # We reuse shuffled_moe_input as an output buffer.
+            self._moe_gather(shuffled_moe_input, permuted_output_unordered, local_scores, local_mapped_slots, local_expert_counts)
+
+        # 7. a2a back
+        dist.all_to_all_single(
+            repeated_moe_input,
+            shuffled_moe_input,
+            output_split_sizes=send_expert_counts_per_rank,
+            input_split_sizes=recv_expert_counts_per_rank,
+            group=ep_group
+        )
+
+        if not empty_run:
+            # 8. Sum repeated_moe_input for expert tensor parallelism.
+            repeated_moe_input = repeated_moe_input.reshape(self.expert_tp_degree, -1, repeated_moe_input.shape[-1])
+            repeated_moe_input = repeated_moe_input.sum(0)
+
+            # 9. Gather tokens to follow original orders.
+            output = empty_from(self._output, (hidden_states.shape[0], self._output.shape[-1]))
+            self._moe_gather(output, repeated_moe_input, scores, mapped_slots, self._expert_counts)
+
+            return output
+        else:
+            return
