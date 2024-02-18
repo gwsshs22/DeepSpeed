@@ -8,6 +8,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 
 import deepspeed.comm as dist
+from deepspeed.accelerator import get_accelerator
 
 from ...allocator import empty_from
 from ...config_v2 import RaggedInferenceEngineConfig
@@ -137,7 +138,8 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
     """
 
     def __init__(self, config: DSModelImplementationConfig, engine_config: RaggedInferenceEngineConfig,
-                 base_mp_group: MPType) -> None:
+                 base_mp_group: MPType,
+                 base_ep_group: MPType) -> None:
         """
         Base implementation for initialization. By default, this will initialize
         the traditional components of a transformer model:
@@ -155,8 +157,9 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
                 model implementation.
             engine_config (RaggedInferenceEngineConfig): Engine configuration.
             base_mp_group (MPType): Base communication group for Tensor-parallel inference.
+            base_ep_group (MPType): Base communication group for Expert-parallel inference.
         """
-        super().__init__(config, engine_config, base_mp_group)
+        super().__init__(config, engine_config, base_mp_group, base_ep_group)
 
         self.make_norm_layer()
         self.make_qkv_layer()
@@ -259,3 +262,9 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
             residual, hidden_states = self._forward_transformer(layer_idx, residual, hidden_states, wrapped_batch)
 
         return self._forward_unembed(residual, wrapped_batch)
+
+    def empty_run(self) -> None:
+        for layer_idx in range(self.num_layers):
+            cur_params = self._transformer[layer_idx]
+            self.moe(None, None, cur_params.moe_gate, cur_params.moe_mlp_1,
+                                 cur_params.moe_mlp_2)

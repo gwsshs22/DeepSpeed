@@ -4,3 +4,4 @@
 # DeepSpeed Team
 
 from .cutlass_multi_gemm import DSMultiGemmMoE
+from .cutlass_multi_gemm_ep import DSMultiGemmMoEEp

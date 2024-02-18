@@ -15,6 +15,16 @@ class DeepSpeedTPConfig(DeepSpeedConfigModel):
     tp_size: int = 1
     """ Number of devices to split the model across using tensor parallelism. """
 
+class DeepSpeedEPConfig(DeepSpeedConfigModel):
+    """ Configure expert parallelism settings """
+
+    enabled: bool = False
+
+    replica_num: int = 1
+    """
+    Number of model replicas. Each replics will serve (NUM_EXPERTS // replica_num) experts.
+    If NUM_EXPERTS < replica_num, we apply tensor parallelism on top of EP.
+    """
 
 class RaggedInferenceEngineConfig(DeepSpeedConfigModel):
     """ Sets parameters for DeepSpeed Inference Engine. """
@@ -24,6 +34,8 @@ class RaggedInferenceEngineConfig(DeepSpeedConfigModel):
     Configuration for tensor parallelism used to split the model across several
     GPUs. Expects a dictionary containing values for :any:`DeepSpeedTPConfig`.
     """
+
+    expert_parallel: DeepSpeedEPConfig = Field({}, alias="ep")
 
     state_manager: DSStateManagerConfig = Field({}, alias="manager")
     """

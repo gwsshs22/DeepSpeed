@@ -21,3 +21,13 @@ void launch_moe_scatter(T* moe_input,
                         const int32_t n_experts,
                         const int32_t n_top_k,
                         cudaStream_t stream);
+
+void launch_moe_build_local_permute_mapping(
+    int32_t* local_assignments,
+    int32_t* local_offsets,
+    const int64_t* local_expert_cumsum,
+    const int64_t* local_per_expert_cumsum,
+    const int32_t local_expert_counts_max,
+    const int32_t ep_size,
+    const int32_t n_local_experts,
+    cudaStream_t stream);

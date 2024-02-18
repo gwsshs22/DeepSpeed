@@ -13,7 +13,7 @@ from .model import MistralInferenceModel
 
 class MistralPolicy(InferenceV2Policy):
 
-    def instantiate_model(self, engine_config: RaggedInferenceEngineConfig, mp_group: Any) -> MistralInferenceModel:
+    def instantiate_model(self, engine_config: RaggedInferenceEngineConfig, mp_group: Any, ep_group: Any) -> MistralInferenceModel:
         return MistralInferenceModel(config=self._model_config, engine_config=engine_config, base_mp_group=mp_group)
 
     def build_container_map(self) -> ContainerMap:

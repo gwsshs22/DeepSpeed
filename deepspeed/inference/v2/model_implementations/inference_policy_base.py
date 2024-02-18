@@ -137,7 +137,7 @@ class InferenceV2Policy(ABC, metaclass=PolicyMeta):
         self._inf_checkpoint_path = inf_checkpoint_path
         self._model_config = model_config
 
-    def build_model(self, engine_config: RaggedInferenceEngineConfig, mp_group: Any) -> DSInferenceModelBase:
+    def build_model(self, engine_config: RaggedInferenceEngineConfig, mp_group: Any, ep_group: Any) -> DSInferenceModelBase:
         """
         Completely instantiate the inference model. This will both create the ops needed to run the
         model, as well as load the model parameters via the checkpoint engine. For more context
@@ -153,7 +153,7 @@ class InferenceV2Policy(ABC, metaclass=PolicyMeta):
             DSInferenceModelBase: An implementation of the inference model abstraction that will be
                 run by the engine.
         """
-        self.model = self.instantiate_model(engine_config, mp_group)
+        self.model = self.instantiate_model(engine_config, mp_group, ep_group)
         self.populate_model_parameters()
         return self.model
 

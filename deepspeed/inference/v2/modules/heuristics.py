@@ -105,16 +105,18 @@ def instantiate_moe(moe_config: DSMoEConfig, engine_config: RaggedInferenceEngin
         A MoE module implementing the given configuration.
     """
 
-    moe_type = "cutlass_multi_gemm_moe"
+    if moe_config.enable_ep:
+        moe_type = "cutlass_multi_gemm_moe_ep"
+    else:
+        moe_type = "cutlass_multi_gemm_moe"
 
-    if moe_type == "cutlass_multi_gemm_moe":
-        # TODO: Get this off an engine config
-        implementation_config = {
-            "weight_dtype": moe_config.input_dtype,
-        }
+    # TODO: Get this off an engine config
+    implementation_config = {
+        "weight_dtype": moe_config.input_dtype,
+    }
 
     # Currently, we only have one implementation, so we just return it.
-    config = ConfigBundle(name="cutlass_multi_gemm_moe",
+    config = ConfigBundle(name=moe_type,
                           config=moe_config,
                           implementation_config=implementation_config)
     return DSMoERegistry.instantiate_config(config)
