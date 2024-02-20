@@ -10,7 +10,7 @@ import torch
 from deepspeed.accelerator import get_accelerator
 import deepspeed.comm as dist
 from ....allocator import empty_from
-from ....inference_utils import ActivationType, is_gated
+from ....inference_utils import ActivationType, is_gated, collect_expert_dist
 from ....kernels.core_ops import BlasLibLinear, CUDAGatedActivation
 from ....kernels.ragged_ops import (
     MoEBuildLocalPermuteMapping,
@@ -60,6 +60,7 @@ class DSMultiGemmMoEEp(DSMoEBase):
         self.expert_tp_degree = max(1, self.ep_size // self.n_experts)
         self.n_top_k = self._config.top_k
         self.intermediate_dim = self._config.intermediate_features
+        assert not collect_expert_dist(), "Use tensor parallelism to collect expert assignments."
 
         moe_op_act_fn = ActivationType.IDENTITY if is_gated(self._config.activation) else self._config.activation
 

@@ -9,7 +9,7 @@ import torch
 
 from deepspeed.accelerator import get_accelerator
 from ....allocator import empty_from
-from ....inference_utils import ActivationType, is_gated
+from ....inference_utils import ActivationType, is_gated, collect_expert_dist
 from ....kernels.core_ops import BlasLibLinear, CUDAGatedActivation
 from ....kernels.ragged_ops import (
     MoEGather,
@@ -71,6 +71,7 @@ class DSMultiGemmMoE(DSMoEBase):
         self._top_k_gate = RaggedTopKGating(config.input_dtype)
         self._moe_scatter = MoEScatter(config.input_dtype, config.model_dim)
         self._moe_gather = MoEGather(config.input_dtype, config.model_dim, config.normalize_scores)
+        self._collect_expert_dist = collect_expert_dist()
 
         self._create_buffers()
 
@@ -190,7 +191,7 @@ class DSMultiGemmMoE(DSMoEBase):
         self._moe_scatter(moe_input, self._expert_cumsum, mapped_slots, hidden_states, self._expert_counts,
                           assignments, offsets)
 
-        return moe_input, self._expert_cumsum, scores, mapped_slots
+        return moe_input, self._expert_cumsum, scores, mapped_slots, assignments
 
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -209,7 +210,7 @@ class DSMultiGemmMoE(DSMoEBase):
             gate_w (torch.Tensor): Gate weight tensor. Expected shape is [num_experts, model_dim].
         """
 
-        moe_input, expert_cumsum, scores, mapped_slots = self._gate(hidden_states, batch_metadata, gate_w)
+        moe_input, expert_cumsum, scores, mapped_slots, assignments = self._gate(hidden_states, batch_metadata, gate_w)
 
         # Get views on the buffers for GEMM
         intermediate = empty_from(self._intermediate,
@@ -247,4 +248,8 @@ class DSMultiGemmMoE(DSMoEBase):
         )
 
         self._moe_gather(output, output_unordered, scores, mapped_slots, self._expert_counts)
-        return output
+
+        if self._collect_expert_dist:
+            return output, assignments.to("cpu"), scores.to("cpu")
+        else:
+            return output, None, None
