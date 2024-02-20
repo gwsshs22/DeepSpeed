@@ -15,6 +15,7 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.comm.comm import init_distributed
 
+from .inference_utils import profiling_enabled
 from .model_implementations import InferenceV2Policy
 from .logging import inference_logger
 from .ragged import DSStateManager, RaggedBatchWrapper, PlaceholderSequenceDescriptor
@@ -93,6 +94,7 @@ class InferenceEngineV2:
                                              self._model.kv_cache_config(),
                                              base_mp_group=self._base_mp_group)
         self._model.set_state_manager(self._state_manager)
+        self._profiling_enabled = profiling_enabled()
 
     def _initialize_comm_groups(self):
         """
@@ -160,7 +162,10 @@ class InferenceEngineV2:
         self._model.prepare_batch(self._batch)
 
         # Model implementation will pick up in the forward.
-        logits = self._model.forward(self._batch)
+        if self._profiling_enabled:
+            logits, profiling_result = self._model.forward(self._batch)
+        else:
+            logits = self._model.forward(self._batch)
 
         # We return one set of logits per sequence in the batch (saves cost on unembedding)
         assert logits.shape[0] == self._batch.current_sequences
@@ -170,7 +175,10 @@ class InferenceEngineV2:
             host_seq_desc.post_forward()  # Updates sequence metadata.
             self._model.maybe_free_kv(host_seq_desc)
 
-        return logits
+        if self._profiling_enabled:
+            return logits, profiling_result
+        else:
+            return logits
 
     def query(self, uid: int, max_request_tokens: int, max_request_blocks) -> Tuple[int, torch.Tensor]:
         """

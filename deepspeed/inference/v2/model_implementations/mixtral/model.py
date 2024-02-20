@@ -12,7 +12,7 @@ from deepspeed.accelerator import get_accelerator
 
 from ...allocator import empty_from
 from ...config_v2 import RaggedInferenceEngineConfig
-from ...inference_utils import ActivationType, DtypeEnum
+from ...inference_utils import ActivationType, DtypeEnum, collect_expert_dist, ProfilingResult
 from ...model_implementations import *
 from ...modules.configs import *
 from ...modules.interfaces import *
@@ -169,6 +169,7 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
         self.make_embedding_layer()
         self.make_unembedding_layer()
         self._kv_cache_config = None
+        self._collect_expert_dist = collect_expert_dist()
 
     def _forward_embed(self, ragged_batch: RaggedBatchWrapper) -> torch.Tensor:
         """
@@ -214,8 +215,8 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
 
         residual, hidden_states = self.norm(residual, hidden_states, cur_params.mlp_norm_gamma)
 
-        hidden_states = self.moe(hidden_states, ragged_batch_info, cur_params.moe_gate, cur_params.moe_mlp_1,
-                                 cur_params.moe_mlp_2)
+        hidden_states, assignments, scores = self.moe(hidden_states, ragged_batch_info, cur_params.moe_gate,
+                                              cur_params.moe_mlp_1, cur_params.moe_mlp_2)
 
         if self.tp_size > 1:
             dist.all_reduce(hidden_states, group=self._base_mp_group)
@@ -228,7 +229,7 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
             # here is safe.
             residual.add_(hidden_states)
 
-        return residual, hidden_states
+        return residual, hidden_states, assignments, scores
 
     def _forward_unembed(self, hidden_states: torch.Tensor, ragged_batch_info: RaggedBatchWrapper) -> torch.Tensor:
         """
@@ -258,10 +259,21 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
 
         residual, hidden_states = self.norm(residual, None, self._transformer[0].attn_norm_gamma, beta=None)
 
-        for layer_idx in range(self.num_layers):
-            residual, hidden_states = self._forward_transformer(layer_idx, residual, hidden_states, wrapped_batch)
+        expert_assignments = []
+        expert_scores = []
 
-        return self._forward_unembed(residual, wrapped_batch)
+        for layer_idx in range(self.num_layers):
+            residual, hidden_states, assignments, scores = self._forward_transformer(layer_idx, residual, hidden_states, wrapped_batch)
+            if self._collect_expert_dist:
+                expert_assignments.append(assignments)
+                expert_scores.append(scores)
+
+        if self._collect_expert_dist:
+            return self._forward_unembed(residual, wrapped_batch), \
+                ProfilingResult(expert_assignments=expert_assignments,
+                                expert_scores=expert_scores)
+        else:
+            return self._forward_unembed(residual, wrapped_batch)
 
     def empty_run(self) -> None:
         for layer_idx in range(self.num_layers):

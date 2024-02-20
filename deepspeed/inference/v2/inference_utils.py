@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
-from typing import Dict
+import os
+from typing import Dict, Any
+from dataclasses import dataclass
 
 import torch
 
@@ -103,3 +104,31 @@ def ceil_div(a: int, b: int) -> int:
     Return ceil(a / b).
     """
     return -(-a // b)
+
+
+@dataclass
+class ProfilingResult:
+    expert_assignments: Any = None
+    expert_scores: Any = None
+
+PROFILING_ENABLED = False
+COLLECT_EXPERT_DIST = False
+
+def set_collect_expert_dist(v) -> None:
+    global PROFILING_ENABLED
+    global COLLECT_EXPERT_DIST
+
+    if v:
+        PROFILING_ENABLED = True
+        COLLECT_EXPERT_DIST = True
+    else:
+        PROFILING_ENABLED = False
+        COLLECT_EXPERT_DIST = False
+
+def profiling_enabled() -> bool:
+    global PROFILING_ENABLED
+    return PROFILING_ENABLED
+
+def collect_expert_dist() -> bool:
+    global COLLECT_EXPERT_DIST
+    return COLLECT_EXPERT_DIST
