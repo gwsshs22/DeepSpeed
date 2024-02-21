@@ -367,6 +367,6 @@ class DSMultiGemmMoEEp(DSMoEBase):
             output = empty_from(self._output, (hidden_states.shape[0], self._output.shape[-1]))
             self._moe_gather(output, repeated_moe_input, scores, mapped_slots, self._expert_counts)
 
-            return output
+            return output, None, None
         else:
             return
