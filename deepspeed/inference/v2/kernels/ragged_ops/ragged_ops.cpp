@@ -45,5 +45,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("moe_build_local_permute_mapping", &moe_build_local_permute_mapping, "Prepare mapping for local permute");
 
     // top_k_gating.h
-    m.def("top_k_gating", &top_k_gating, "Top-1 gating for MoE with ragged batch awareness.");
+    m.def("top_k_gating", &top_k_gating, "Top-k gating for MoE with ragged batch awareness.");
+    m.def("simulated_top_k_gating", &simulated_top_k_gating, "Simulated top-k gating for MoE with ragged batch awareness.");
 }

@@ -113,6 +113,8 @@ class ProfilingResult:
 
 PROFILING_ENABLED = False
 COLLECT_EXPERT_DIST = False
+SIMULATED_GATING = False
+SIMULATED_GATING_TEMPERATURE = 1.0
 
 def set_collect_expert_dist(v) -> None:
     global PROFILING_ENABLED
@@ -132,3 +134,21 @@ def profiling_enabled() -> bool:
 def collect_expert_dist() -> bool:
     global COLLECT_EXPERT_DIST
     return COLLECT_EXPERT_DIST
+
+def enable_simulated_gating(simulated_gating_temperature=1.0) -> None:
+    global SIMULATED_GATING
+    global SIMULATED_GATING_TEMPERATURE
+    SIMULATED_GATING = True
+    SIMULATED_GATING_TEMPERATURE = simulated_gating_temperature
+
+def simulated_gating_temperature() -> float:
+    global SIMULATED_GATING_TEMPERATURE
+    return SIMULATED_GATING_TEMPERATURE
+
+def disable_simulated_gating() -> None:
+    global SIMULATED_GATING
+    SIMULATED_GATING = False
+
+def simulated_gating() -> bool:
+    global SIMULATED_GATING
+    return SIMULATED_GATING

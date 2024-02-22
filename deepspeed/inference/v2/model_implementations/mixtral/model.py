@@ -263,6 +263,7 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
         expert_scores = []
 
         for layer_idx in range(self.num_layers):
+            wrapped_batch.current_layer = layer_idx
             residual, hidden_states, assignments, scores = self._forward_transformer(layer_idx, residual, hidden_states, wrapped_batch)
             if self._collect_expert_dist:
                 expert_assignments.append(assignments)

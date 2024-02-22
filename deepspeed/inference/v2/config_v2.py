@@ -41,3 +41,7 @@ class RaggedInferenceEngineConfig(DeepSpeedConfigModel):
     """
     Configuration for managing persistent state
     """
+
+    simulated_gating: bool = False
+
+    simulated_gating_temperature: float = 1.0
