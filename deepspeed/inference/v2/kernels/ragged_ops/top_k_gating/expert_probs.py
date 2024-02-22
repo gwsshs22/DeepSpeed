@@ -1,3 +1,4 @@
+from ....logging import inference_logger
 import torch
 
 # Pre-calculated expert counts with Mixtral8x7B model on chatbot_arena_conversations dataset.
@@ -91,6 +92,7 @@ def init_expert_probs(num_layers, n_experts, n_top_k, temparature, device):
         assert _EXPERT_PROBS[0].shape[0] == n_top_k
         return
 
+    inference_logger().info(f"Initialize simulated gating with temparature={temparature}")
     top1_expert_counts = torch.tensor(_TOP_1_EXPERT_COUNTS, device=device)
     top2_expert_counts = torch.tensor(_TOP_2_EXPERT_COUNTS, device=device)
 
