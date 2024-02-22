@@ -8,8 +8,9 @@ import torch
 import torch.nn.functional as F
 
 from deepspeed.accelerator import get_accelerator
-from deepspeed.inference.v2.inference_utils import DtypeEnum
+from deepspeed.inference.v2.inference_utils import DtypeEnum, enable_simulated_gating, disable_simulated_gating
 from deepspeed.inference.v2.kernels.ragged_ops import RaggedTopKGating
+from deepspeed.inference.v2.kernels.ragged_ops.top_k_gating.expert_probs import init_expert_probs, get_expert_probs, clear_expert_probs
 from .ragged_testing_utils import build_simple_batch
 from ...inference_test_utils import allclose
 
@@ -169,3 +170,28 @@ def test_score_accuracy(n_tokens: int, n_experts: int) -> None:
 
     assert allclose(scores, ref_scores)
     assert expert_counts.sum() == n_tokens
+
+
+@pytest.mark.disag_moe
+def test_expert_probs() -> None:
+    init_expert_probs(32, 8, 1, 1.0, "cpu")
+    print(get_expert_probs(0))
+    print(get_expert_probs(31))
+    clear_expert_probs()
+
+    init_expert_probs(4, 8, 2, 1.0, "cpu")
+    print(get_expert_probs(0))
+    print(get_expert_probs(3))
+    clear_expert_probs()
+
+    init_expert_probs(4, 8, 2, 100.0, "cpu")
+    print("Temperature 100.0")
+    print(get_expert_probs(0))
+    print(get_expert_probs(3))
+    clear_expert_probs()
+
+    init_expert_probs(4, 8, 2, 0.1, "cpu")
+    print("Temperature 0.1")
+    print(get_expert_probs(0))
+    print(get_expert_probs(3))
+    clear_expert_probs()

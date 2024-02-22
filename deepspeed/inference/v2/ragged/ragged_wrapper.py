@@ -113,6 +113,7 @@ class RaggedBatchWrapper:
         # Default behavior should be no padding
         self._is_padded = False
 
+        self._current_layer = 0
         self._current_tokens = 0
         self._current_sequences = 0
         self._batch_tokens = []
@@ -185,6 +186,7 @@ class RaggedBatchWrapper:
         """
         Completes construction of the ragged batch by flushing the host buffers to the device.
         """
+        self._current_layer = 0
         cur_toks = self.current_tokens
 
         # Batch-copy the values recorded in insert_sequence() into PyTorch tensors to enhance efficiency.
@@ -290,3 +292,11 @@ class RaggedBatchWrapper:
         synchronization with the device.
         """
         return self._current_sequences
+
+    @property
+    def current_layer(self) -> int:
+        return self._current_layer
+
+    @current_layer.setter
+    def current_layer(self, value):
+        self._current_layer = value

@@ -614,6 +614,7 @@ class DSMoETransformerModelBase(DSTransformerModelBase):
             normalize_scores=self.normalize_expert_scores,
             enable_ep=self._engine_config.expert_parallel.enabled,
             ep_size=self.ep_size,
+            num_layers=self.num_layers
         )
 
         self.moe = heuristics.instantiate_moe(moe_config, self._engine_config)

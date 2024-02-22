@@ -59,3 +59,59 @@ void top_k_gating(torch::Tensor& expert_counts,
 
     TORCH_CHECK(false, "Unsupported dtype for logits in top_k_gating");
 }
+
+
+#define DISPATCH_SIMUL_TOP_K_GATING(T_TYPE, C_TYPE)                           \
+    if (logits.options().dtype() == torch::T_TYPE) {                          \
+        launch_simulated_top_k_gating((int32_t*) expert_counts.data_ptr(),    \
+                                      (float*) scores.data_ptr(),             \
+                                      (int32_t*) assignments.data_ptr(),      \
+                                      (int32_t*) offsets.data_ptr(),          \
+                                      (const C_TYPE*)logits.data_ptr(),       \
+                                      (const float*) expert_probs.data_ptr(), \
+                                      n_tokens,                               \
+                                      n_experts,                              \
+                                      n_top_k,                                \
+                                      batch_metadata_ptr,                     \
+                                      at::cuda::getCurrentCUDAStream());      \
+        return;                                                               \
+    }
+
+
+void simulated_top_k_gating(torch::Tensor& expert_counts,
+                            torch::Tensor& scores,
+                            torch::Tensor& assignments,
+                            torch::Tensor& offsets,
+                            torch::Tensor& logits,
+                            torch::Tensor& expert_probs,
+                            torch::Tensor& batch_metadata)
+{
+    const int32_t n_tokens = scores.size(0);
+    const int32_t n_top_k = scores.size(1);
+    const int32_t n_experts = logits.size(1);
+
+    TORCH_CHECK(n_tokens == offsets.size(0));
+    TORCH_CHECK(n_tokens == assignments.size(0));
+
+    TORCH_CHECK(n_top_k == offsets.size(1));
+    TORCH_CHECK(n_top_k == assignments.size(1));
+    TORCH_CHECK(n_top_k == expert_probs.size(0));
+    TORCH_CHECK(n_experts == expert_probs.size(1));
+
+    TORCH_CHECK(expert_counts.scalar_type() == torch::kInt32);
+    TORCH_CHECK(scores.scalar_type() == torch::kFloat);
+    TORCH_CHECK(assignments.scalar_type() == torch::kInt32);
+    TORCH_CHECK(offsets.scalar_type() == torch::kInt32);
+
+    TORCH_CHECK(expert_probs.size(0) == 1 || expert_probs.size(0) == 2);
+    const RaggedBatchDescriptor* batch_metadata_ptr =
+        reinterpret_cast<const RaggedBatchDescriptor*>(batch_metadata.data_ptr());
+
+    DISPATCH_SIMUL_TOP_K_GATING(kFloat, float)
+    DISPATCH_SIMUL_TOP_K_GATING(kHalf, __half)
+#ifdef BF16_AVAILABLE
+    DISPATCH_SIMUL_TOP_K_GATING(kBFloat16, __nv_bfloat16)
+#endif
+
+    TORCH_CHECK(false, "Unsupported dtype for logits in top_k_gating");
+}

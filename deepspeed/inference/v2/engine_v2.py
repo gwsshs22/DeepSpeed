@@ -15,7 +15,7 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.comm.comm import init_distributed
 
-from .inference_utils import profiling_enabled
+from .inference_utils import profiling_enabled, enable_simulated_gating
 from .model_implementations import InferenceV2Policy
 from .logging import inference_logger
 from .ragged import DSStateManager, RaggedBatchWrapper, PlaceholderSequenceDescriptor
@@ -76,6 +76,8 @@ class InferenceEngineV2:
             engine_config (RaggedInferenceEngineConfig): Configuration for the inference engine.
         """
         self._config = engine_config
+        if self._config.simulated_gating:
+            enable_simulated_gating(self._config.simulated_gating_temperature)
 
         if self._config.expert_parallel.enabled:
             assert self._config.tensor_parallel.tp_size == 1, "TP + EP is currently not supported"

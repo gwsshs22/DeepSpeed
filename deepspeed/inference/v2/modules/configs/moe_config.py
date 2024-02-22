@@ -58,3 +58,5 @@ class DSMoEConfig(DSModuleConfig):
     enable_ep: bool = False
 
     ep_size: int = -1
+
+    num_layers: int = -1

@@ -74,7 +74,8 @@ class DSMultiGemmMoEEp(DSMoEBase):
             self._activation = None
 
         self._gate_proj = BlasLibLinear(self._config.input_dtype)
-        self._top_k_gate = RaggedTopKGating(config.input_dtype)
+
+        self._top_k_gate = RaggedTopKGating(config.input_dtype, num_layers=config.num_layers, n_experts=self.n_experts, n_top_k=self.n_top_k)
         self._moe_scatter = MoEScatter(config.input_dtype, config.model_dim)
         self._moe_build_local_permute_mapping = MoEBuildLocalPermuteMapping(config.input_dtype, config.model_dim)
         self._moe_gather = MoEGather(config.input_dtype, config.model_dim, config.normalize_scores)
