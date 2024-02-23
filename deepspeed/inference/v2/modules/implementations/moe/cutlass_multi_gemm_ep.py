@@ -101,6 +101,31 @@ class DSMultiGemmMoEEp(DSMoEBase):
                                     dtype=torch.int32,
                                     device=get_accelerator().current_device())
 
+        # EP related buffers
+        self._recv_expert_counts = torch.empty((self.ep_size, self.n_local_experts),
+                                               dtype=torch.int32,
+                                               device=get_accelerator().current_device())
+
+        self._local_expert_cumsum = torch.empty((self.n_local_experts, ),
+                                               dtype=torch.int64,
+                                               device=get_accelerator().current_device())
+        
+        self._local_scores = torch.ones((self._config.max_tokens * self.n_top_k * self.ep_size, 1),
+                                         dtype=torch.float32,
+                                         device=get_accelerator().current_device())
+        self._local_mapped_slots = torch.empty(
+            (self._config.max_tokens * self.n_top_k * self.ep_size, 1),
+            dtype=torch.int32,
+            device=get_accelerator().current_device()
+        )
+
+        self._local_assignments = torch.empty((self._config.max_tokens * self.n_top_k * self.ep_size, 1),
+                                              dtype=torch.int32,
+                                              device=get_accelerator().current_device())
+        self._local_offsets = torch.empty((self._config.max_tokens * self.n_top_k * self.ep_size, 1),
+                                          dtype=torch.int32,
+                                          device=get_accelerator().current_device())
+
         # Scatter buffers
         self._moe_input = torch.empty((self._config.max_tokens * self.n_top_k, self._config.model_dim),
                                       dtype=self._config.input_dtype,
@@ -112,17 +137,25 @@ class DSMultiGemmMoEEp(DSMoEBase):
                                          dtype=torch.int32,
                                          device=get_accelerator().current_device())
 
+        self._shuffled_moe_input = torch.empty((self._config.max_tokens * self.n_top_k * self.ep_size, self._config.model_dim),
+                                               dtype=self._config.output_dtype,
+                                               device=get_accelerator().current_device())
+
+        self._permuted_moe_input = torch.empty((self._config.max_tokens * self.n_top_k * self.ep_size, self._config.model_dim),
+                                               dtype=self._config.output_dtype,
+                                               device=get_accelerator().current_device())
+
         # GEMM Buffers
-        self._intermediate = torch.empty((self._config.max_tokens * self.n_top_k, self._config.intermediate_features),
+        self._intermediate = torch.empty((self._config.max_tokens * self.n_top_k * self.ep_size, self._config.intermediate_features),
                                          dtype=self._config.output_dtype,
                                          device=get_accelerator().current_device())
         if self._activation is not None:
             self._gated_intermediate = torch.empty(
-                (self._config.max_tokens * self.n_top_k, self._config.intermediate_features * 2),
+                (self._config.max_tokens * self.n_top_k * self.ep_size, self._config.intermediate_features * 2),
                 dtype=self._config.output_dtype,
                 device=get_accelerator().current_device())
 
-        self._output_unordered = torch.empty((self._config.max_tokens * self.n_top_k, self._config.model_dim),
+        self._output_unordered = torch.empty((self._config.max_tokens * self.n_top_k * self.ep_size, self._config.model_dim),
                                              dtype=self._config.output_dtype,
                                              device=get_accelerator().current_device())
 
@@ -182,21 +215,11 @@ class DSMultiGemmMoEEp(DSMoEBase):
 
         return self._expert_cumsum, scores, assignments, offsets
 
-    def _prepare_local_permute(self, recv_expert_counts, total_recv_tokens):
+    def _prepare_local_permute(self, recv_expert_counts, total_recv_tokens, recv_expert_counts_max):
         recv_expert_cumsum = recv_expert_counts.reshape(-1).cumsum(-1).reshape(*recv_expert_counts.shape)
         recv_per_expert_cumsum = recv_expert_counts.cumsum(0)
-
-        # TODO(gwkim): We may need to use preallocated buffer
-        local_assignments = torch.empty(
-            (total_recv_tokens, 1),
-            dtype=torch.int32,
-            device=recv_expert_counts.device)
-        local_offsets = torch.empty(
-            (total_recv_tokens, 1),
-            dtype=torch.int32,
-            device=recv_expert_counts.device)
-
-        recv_expert_counts_max = recv_expert_counts.max().item()
+        local_assignments = empty_from(self._local_assignments, (total_recv_tokens, 1))
+        local_offsets = empty_from(self._local_offsets, (total_recv_tokens, 1))
 
         self._moe_build_local_permute_mapping(
             local_assignments,
@@ -276,16 +299,17 @@ class DSMultiGemmMoEEp(DSMoEBase):
 
         # Implementation adopted from https://github.com/stanford-futuredata/megablocks/blob/main/megablocks/layers/moe.py.
         # 1. All-to-all recv/send token counts.
-        send_expert_counts = self._expert_counts.reshape(-1, self.n_local_experts).repeat(self.expert_tp_degree, 1)
-        # TODO(gwkim): We may need to use preallocated buffer
-        recv_expert_counts = torch.empty_like(send_expert_counts)
+        send_expert_counts = self._expert_counts.reshape(-1, self.n_local_experts)
+        if self.expert_tp_degree > 1:
+            send_expert_counts = send_expert_counts.repeat(self.expert_tp_degree, 1)
 
         a2a_handle_1 = dist.all_to_all_single(
-            recv_expert_counts,
+            self._recv_expert_counts,
             send_expert_counts,
             async_op=True,
             group=ep_group
         )
+        send_expert_counts_per_rank = send_expert_counts.sum(dim=-1).to("cpu", non_blocking=True)
 
         # 2. First scatter tokens before communicating tokens.
         if not empty_run:
@@ -295,45 +319,36 @@ class DSMultiGemmMoEEp(DSMoEBase):
         a2a_handle_1.wait()
 
         # Repeat tokens for expert tensor parallelism
-        send_expert_counts_per_rank = send_expert_counts.cpu().sum(dim=-1).tolist()
-
-        recv_expert_counts_cpu = recv_expert_counts.cpu()
+        recv_expert_counts_cpu = self._recv_expert_counts.cpu()
         recv_expert_counts_per_rank = recv_expert_counts_cpu.sum(dim=-1).tolist()
-
         total_recv_tokens = sum(recv_expert_counts_per_rank)
 
-        repeated_moe_input = moe_input.repeat(self.expert_tp_degree, 1)
-        shuffled_moe_input = torch.empty(
-            (total_recv_tokens,) + repeated_moe_input.shape[1:],
-            device=repeated_moe_input.device, dtype=repeated_moe_input.dtype)
-
-
+        repeated_moe_input = moe_input if self.expert_tp_degree == 1 else moe_input.repeat(self.expert_tp_degree, 1)
+        shuffled_moe_input = empty_from(self._shuffled_moe_input, (total_recv_tokens, self._shuffled_moe_input.shape[-1]), allow_zero=True)
+        send_expert_counts_per_rank = send_expert_counts_per_rank.tolist()
         a2a_handle_2 = dist.all_to_all_single(
             shuffled_moe_input,
             repeated_moe_input,
             output_split_sizes=recv_expert_counts_per_rank,
             input_split_sizes=send_expert_counts_per_rank,
-            group=ep_group,
-            async_op=True
+            async_op=True,
+            group=ep_group
         )
 
         # 3. Prepare local permute. We need local permute as tokens from different ranks are grouped by experts in contiguous chunks.
-        local_expert_counts, local_assignments, local_offsets = self._prepare_local_permute(recv_expert_counts, total_recv_tokens)
+        if total_recv_tokens > 0:
+            recv_expert_counts_max = recv_expert_counts_cpu.max().item()
+            local_expert_counts, local_assignments, local_offsets = self._prepare_local_permute(self._recv_expert_counts, total_recv_tokens, recv_expert_counts_max)
 
-        local_expert_cumsum = torch.zeros_like(local_expert_counts, dtype=torch.int64)
-        local_scores = torch.ones((total_recv_tokens, 1), device=recv_expert_counts.device)
-        local_mapped_slots = torch.empty(
-            (total_recv_tokens, 1),
-            device=self._mapped_slots.device,
-            dtype=self._mapped_slots.dtype
-        )
-
-        permuted_moe_input = torch.empty_like(shuffled_moe_input)
         a2a_handle_2.wait()
 
         if total_recv_tokens > 0:
+            local_scores = empty_from(self._local_scores, (total_recv_tokens, 1))
+            local_mapped_slots = empty_from(self._local_mapped_slots, (total_recv_tokens, 1))
+
+            permuted_moe_input = empty_from(self._permuted_moe_input, (total_recv_tokens, self._permuted_moe_input.shape[-1]))
             # 4. Do local permute on shuffled_moe_input.
-            self._moe_scatter(permuted_moe_input, local_expert_cumsum, local_mapped_slots, shuffled_moe_input, local_expert_counts,
+            self._moe_scatter(permuted_moe_input, self._local_expert_cumsum, local_mapped_slots, shuffled_moe_input, local_expert_counts,
                             local_assignments, local_offsets)
 
             # 5. Compute expert layers with permuted input.
@@ -343,7 +358,7 @@ class DSMultiGemmMoEEp(DSMoEBase):
                 mlp_2_w,
                 mlp_1_b,
                 mlp_2_b,
-                local_expert_cumsum
+                self._local_expert_cumsum
             )
 
             # 6. Do local unpermute with permuted_output_unordered.
@@ -361,8 +376,9 @@ class DSMultiGemmMoEEp(DSMoEBase):
 
         if not empty_run:
             # 8. Sum repeated_moe_input for expert tensor parallelism.
-            repeated_moe_input = repeated_moe_input.reshape(self.expert_tp_degree, -1, repeated_moe_input.shape[-1])
-            repeated_moe_input = repeated_moe_input.sum(0)
+            if self.expert_tp_degree > 1:
+                repeated_moe_input = repeated_moe_input.reshape(self.expert_tp_degree, -1, repeated_moe_input.shape[-1])
+                repeated_moe_input = repeated_moe_input.sum(0)
 
             # 9. Gather tokens to follow original orders.
             output = empty_from(self._output, (hidden_states.shape[0], self._output.shape[-1]))
