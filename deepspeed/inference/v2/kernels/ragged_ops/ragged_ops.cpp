@@ -42,7 +42,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     // moe_scatter.h
     m.def("moe_scatter", &moe_scatter, "MoE scatter for top-k-gating.");
-    m.def("moe_build_local_permute_mapping", &moe_build_local_permute_mapping, "Prepare mapping for local permute");
+    m.def("moe_summarize_recv_token_stat", &moe_summarize_recv_token_stat, "Summarize moe received token statistics.");
+    m.def("moe_build_local_permute_mapping", &moe_build_local_permute_mapping, "Prepare mapping for local permute.");
 
     // top_k_gating.h
     m.def("top_k_gating", &top_k_gating, "Top-k gating for MoE with ragged batch awareness.");

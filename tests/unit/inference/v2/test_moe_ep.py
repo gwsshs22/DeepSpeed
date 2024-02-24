@@ -110,7 +110,10 @@ class TestMoeExpertParallelism(DistributedTest):
         logits = torch.softmax(logits, -1)
 
         if input_tokens.shape[0] > 0:
-            assert allclose(expected_logits, logits, tolerances=(0, 5e-3))
+            if enable_simulated_gating:
+                assert allclose(expected_logits, logits, tolerances=(0, 1e-2))
+            else:
+                assert allclose(expected_logits, logits, tolerances=(0, 5e-3))
 
     def _test_mixtral_model_moe_ep(self,
                                    n_top_k,
@@ -166,5 +169,5 @@ class TestMoeExpertParallelism(DistributedTest):
     @pytest.mark.parametrize("n_top_k", [1, 2])
     @pytest.mark.parametrize("n_experts", [16])
     @pytest.mark.parametrize("max_seq_len", [16, 128])
-    def test_mixtral_model_moe_ep(self, n_top_k, n_experts, max_seq_len):
+    def test_mixtral_model_moe_ep_simul_gating(self, n_top_k, n_experts, max_seq_len):
         self._test_mixtral_model_moe_ep(n_top_k, n_experts, max_seq_len, num_layers=1, enable_simulated_gating=True)

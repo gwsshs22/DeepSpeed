@@ -66,6 +66,83 @@ void moe_scatter(torch::Tensor& moe_input,
     TORCH_CHECK(false, "Unsupported dtype for moe_scatter")
 }
 
+std::tuple<std::vector<int64_t>, std::vector<int64_t>, int32_t, int64_t> moe_summarize_recv_token_stat(
+    torch::Tensor& recv_expert_cumsum,
+    torch::Tensor& recv_per_expert_cumsum,
+    torch::Tensor& local_expert_counts,
+    torch::Tensor& recv_expert_cumsum_cpu,
+    torch::Tensor& recv_per_expert_cumsum_cpu,
+    torch::Tensor& local_expert_counts_cpu,
+    torch::Tensor& recv_expert_counts,
+    torch::Tensor& send_expert_counts) {
+  const int32_t ep_size = recv_expert_counts.size(0);
+  const int32_t n_local_experts = recv_expert_counts.size(1);
+
+  TORCH_CHECK(recv_expert_cumsum.size(0) == ep_size);
+  TORCH_CHECK(recv_expert_cumsum.size(1) == n_local_experts);
+  TORCH_CHECK(recv_per_expert_cumsum.size(0) == ep_size);
+  TORCH_CHECK(recv_per_expert_cumsum.size(1) == n_local_experts);
+  TORCH_CHECK(local_expert_counts.size(0) == n_local_experts);
+  TORCH_CHECK(send_expert_counts.size(0) == ep_size);
+  TORCH_CHECK(send_expert_counts.size(1) == n_local_experts);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  torch::Tensor recv_expert_counts_cpu = recv_expert_counts.to(torch::kCPU, true, true);
+  torch::Tensor send_expert_counts_cpu = send_expert_counts.to(torch::kCPU, true, true);
+
+  std::vector<int64_t> recv_expert_counts_per_rank(ep_size);
+  std::vector<int64_t> send_expert_counts_per_rank(ep_size);
+  
+  stream.synchronize();
+
+  int32_t recv_expert_counts_max = 0;
+  auto recv_expert_counts_cpu_ptr = recv_expert_counts_cpu.accessor<int32_t, 2>();
+  auto recv_expert_cumsum_cpu_ptr = recv_expert_cumsum_cpu.accessor<int64_t, 2>();
+  int64_t total_recv_tokens = 0;
+  
+  for (int i = 0; i < ep_size; i++) {
+    int64_t sum = 0;
+    for (int j = 0; j < n_local_experts; j++) {
+      int tmp = recv_expert_counts_cpu_ptr[i][j];
+      sum += tmp;
+      total_recv_tokens += tmp;
+      recv_expert_cumsum_cpu_ptr[i][j] = total_recv_tokens;
+
+      if (tmp > recv_expert_counts_max) {
+        recv_expert_counts_max = tmp;
+      }
+    }
+
+    recv_expert_counts_per_rank[i] = sum;
+  }
+  recv_expert_cumsum.copy_(recv_expert_cumsum_cpu, /* non_blocking */ true);
+
+  auto recv_per_expert_cumsum_cpu_ptr = recv_per_expert_cumsum_cpu.accessor<int64_t, 2>();
+  auto local_expert_counts_cpu_ptr = local_expert_counts_cpu.accessor<int32_t, 1>();
+  for (int j = 0; j < n_local_experts; j++) {
+    int64_t sum = 0;
+    for (int i = 0; i < ep_size; i++) {
+      sum += recv_expert_counts_cpu_ptr[i][j];
+      recv_per_expert_cumsum_cpu_ptr[i][j] = sum;
+    }
+
+    local_expert_counts_cpu_ptr[j] = sum;
+  }
+
+  recv_per_expert_cumsum.copy_(recv_per_expert_cumsum_cpu, /* non_blocking */  true);
+  local_expert_counts.copy_(local_expert_counts_cpu, /* non_blocking */  true);
+
+  auto send_expert_counts_cpu_ptr = send_expert_counts_cpu.accessor<int32_t, 2>();
+  for (int i = 0; i < ep_size; i++) {
+    int64_t sum = 0;
+    for (int j = 0; j < n_local_experts; j++) {
+      sum += send_expert_counts_cpu_ptr[i][j];
+    }
+    send_expert_counts_per_rank[i] = sum;
+  }
+
+  return std::make_tuple(recv_expert_counts_per_rank, send_expert_counts_per_rank, recv_expert_counts_max, total_recv_tokens);
+}
 
 void moe_build_local_permute_mapping(torch::Tensor& local_assignments,
                                      torch::Tensor& local_offsets,

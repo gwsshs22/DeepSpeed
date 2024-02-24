@@ -54,6 +54,33 @@ class MoEScatter(DSKernelBase):
         self.kernel(moe_input, expert_cumsum, mapped_slots, activations, expert_counts, assignments, offsets)
         return moe_input, expert_cumsum, mapped_slots
 
+class MoESummarizeRecvTokenStat(DSKernelBase):
+    def __init__(self) -> None:
+        inf_module = RaggedOpsBuilder().load()
+        self.kernel = inf_module.moe_summarize_recv_token_stat
+
+    def __call__(self,
+                 recv_expert_cumsum,
+                 recv_per_expert_cumsum,
+                 local_expert_counts,
+                 recv_expert_cumsum_cpu,
+                 recv_per_expert_cumsum_cpu,
+                 local_expert_counts_cpu,
+                 recv_expert_counts,
+                 send_expert_counts):
+        recv_expert_counts_per_rank, send_expert_counts_per_rank, recv_expert_counts_max, total_recv_tokens = self.kernel(
+            recv_expert_cumsum,
+            recv_per_expert_cumsum,
+            local_expert_counts,
+            recv_expert_cumsum_cpu,
+            recv_per_expert_cumsum_cpu,
+            local_expert_counts_cpu,
+            recv_expert_counts,
+            send_expert_counts
+        )
+
+        return recv_expert_counts_per_rank, send_expert_counts_per_rank, recv_expert_counts_max, total_recv_tokens
+
 class MoEBuildLocalPermuteMapping(DSKernelBase):
     """
     CUDA implementation of MoE local permute mapping.
@@ -87,3 +114,4 @@ class MoEBuildLocalPermuteMapping(DSKernelBase):
                     local_expert_cumsum,
                     local_per_expert_cumsum,
                     recv_expert_counts_max)
+

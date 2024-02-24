@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <tuple>
+
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 #include "moe_scatter.cuh"
@@ -21,6 +23,16 @@ void moe_scatter(torch::Tensor& moe_input,
                  torch::Tensor& expert_counts,
                  torch::Tensor& assignments,
                  torch::Tensor& offsets);
+
+std::tuple<std::vector<int64_t>, std::vector<int64_t>, int32_t, int64_t> moe_summarize_recv_token_stat(
+    torch::Tensor& recv_expert_cumsum,
+    torch::Tensor& recv_per_expert_cumsum,
+    torch::Tensor& local_expert_counts,
+    torch::Tensor& recv_expert_cumsum_cpu,
+    torch::Tensor& recv_per_expert_cumsum_cpu,
+    torch::Tensor& local_expert_counts_cpu,
+    torch::Tensor& recv_expert_counts,
+    torch::Tensor& send_expert_counts);
 
 void moe_build_local_permute_mapping(torch::Tensor& local_assignments,
                                      torch::Tensor& local_offsets,
