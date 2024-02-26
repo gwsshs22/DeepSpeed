@@ -2,6 +2,7 @@ import deepspeed.comm as dist
 from deepspeed.inference.v2.checkpoint.in_memory_engine import InMemoryModelEngine
 from deepspeed.inference.v2.model_implementations import MixtralPolicy
 from deepspeed.inference.v2.engine_v2 import InferenceEngineV2
+from deepspeed.inference.v2.tracer import get_tracer
 from deepspeed.inference.v2.config_v2 import RaggedInferenceEngineConfig
 from deepspeed.inference.v2.inference_utils import enable_simulated_gating, disable_simulated_gating
 from deepspeed.inference.v2.kernels.ragged_ops.top_k_gating.expert_probs import clear_expert_probs
@@ -40,7 +41,7 @@ class TestMoeExpertParallelism(DistributedTest):
         model = MixtralForCausalLM(model_config)
         return model, model_config
 
-    def _build_engine(self, model, model_config, max_seq_len, enable_ep, enable_simulated_gating):
+    def _build_engine(self, model, model_config, max_seq_len, enable_ep, enable_simulated_gating, trace_enabled):
         disable_simulated_gating()
         clear_expert_probs()
 
@@ -54,7 +55,8 @@ class TestMoeExpertParallelism(DistributedTest):
             "tensor_parallel": {
                 "tp_size": 1
             },
-            "simulated_gating": enable_simulated_gating
+            "simulated_gating": enable_simulated_gating,
+            "trace_enabled": trace_enabled
         }
 
         if enable_ep:
@@ -75,7 +77,7 @@ class TestMoeExpertParallelism(DistributedTest):
         seq_len = random.randint(1, max_seq_len)
         return torch.randint(0, vocab_size, (seq_len,))
 
-    def _assert_output(self, model, model_config, logits, input_tokens, max_seq_len, n_experts, enable_simulated_gating):
+    def _assert_output(self, model, model_config, logits, input_tokens, max_seq_len, n_experts, enable_simulated_gating, trace_enabled):
         local_rank = int(os.environ.get("LOCAL_RANK"))
         device = logits.device
 
@@ -94,7 +96,7 @@ class TestMoeExpertParallelism(DistributedTest):
         if local_rank == 0:
             # Build a new engine that serves the model without any parallelisms.
             disable_simulated_gating()
-            engine = self._build_engine(model, model_config, max_seq_len, enable_ep=False, enable_simulated_gating=enable_simulated_gating)
+            engine = self._build_engine(model, model_config, max_seq_len, enable_ep=False, enable_simulated_gating=enable_simulated_gating, trace_enabled=trace_enabled)
             input_tokens_list = []
             for i in range(self.world_size):
                 input_tokens_list.append(batched_input_tokens[i][:seq_lens[i]].to("cpu"))
@@ -123,7 +125,8 @@ class TestMoeExpertParallelism(DistributedTest):
                                    vocab_size=32000,
                                    input_gen_random_seed=None,
                                    test_empty_run=False,
-                                   enable_simulated_gating=False):
+                                   enable_simulated_gating=False,
+                                   trace_enabled=False):
 
         local_rank = int(os.environ.get("LOCAL_RANK"))
         if test_empty_run and local_rank > 0:
@@ -134,13 +137,13 @@ class TestMoeExpertParallelism(DistributedTest):
         torch.manual_seed(5000)
         model, model_config = self._build_mixtral_model(n_experts=n_experts, vocab_size=vocab_size, n_top_k=n_top_k, num_hidden_layers=num_layers)
 
-        engine = self._build_engine(model, model_config, max_seq_len, enable_ep=True, enable_simulated_gating=enable_simulated_gating)
+        engine = self._build_engine(model, model_config, max_seq_len, enable_ep=True, enable_simulated_gating=enable_simulated_gating, trace_enabled=trace_enabled)
         if input_tokens.shape[0] != 0:
             logits = engine.put([0], [input_tokens], do_checks=False)
         else:
             engine.empty_run()
             logits = torch.empty(0, vocab_size, device=f'cuda:{local_rank}')
-        self._assert_output(model, model_config, logits, input_tokens, max_seq_len, n_experts, enable_simulated_gating)
+        self._assert_output(model, model_config, logits, input_tokens, max_seq_len, n_experts, enable_simulated_gating, trace_enabled)
 
     @pytest.mark.disag_moe
     @pytest.mark.parametrize("n_top_k", [1, 2])
@@ -171,3 +174,12 @@ class TestMoeExpertParallelism(DistributedTest):
     @pytest.mark.parametrize("max_seq_len", [16, 128])
     def test_mixtral_model_moe_ep_simul_gating(self, n_top_k, n_experts, max_seq_len):
         self._test_mixtral_model_moe_ep(n_top_k, n_experts, max_seq_len, num_layers=1, enable_simulated_gating=True)
+
+    @pytest.mark.disag_moe
+    @pytest.mark.parametrize("n_top_k", [2])
+    @pytest.mark.parametrize("n_experts", [8])
+    @pytest.mark.parametrize("max_seq_len", [128])
+    def test_mixtral_model_moe_ep_tracer(self, n_top_k, n_experts, max_seq_len):
+        self._test_mixtral_model_moe_ep(n_top_k, n_experts, max_seq_len, num_layers=2, trace_enabled=True)
+        for s in get_tracer().batch_summaries():
+            print(s)

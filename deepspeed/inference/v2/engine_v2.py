@@ -22,6 +22,7 @@ from .ragged import DSStateManager, RaggedBatchWrapper, PlaceholderSequenceDescr
 from .scheduling_utils import SchedulingError, SchedulingResult
 from .model_implementations.flat_model_helpers import make_param_filename, make_metadata_filename
 from .model_implementations.inference_model_base import DSInferenceModelBase
+from .tracer import Tracer, set_tracer
 
 from .config_v2 import RaggedInferenceEngineConfig
 
@@ -98,6 +99,12 @@ class InferenceEngineV2:
         self._model.set_state_manager(self._state_manager)
         self._profiling_enabled = profiling_enabled()
 
+        if engine_config.trace_enabled:
+            self._tracer = Tracer()
+            set_tracer(self._tracer)
+        else:
+            self._tracer = None
+
     def _initialize_comm_groups(self):
         """
         Implementation of our TP group initialization.
@@ -147,6 +154,8 @@ class InferenceEngineV2:
                 raise SchedulingError(schedule_check)
 
         self._batch.clear()
+        if self._tracer:
+            self._tracer.init_batch(is_empty_run=False, num_layers=self._model.num_layers)
         for uid, tokens in zip(batch_uids, batch_tokens):
 
             host_seq_desc = self._state_manager.get_or_create_sequence(uid)
@@ -155,6 +164,8 @@ class InferenceEngineV2:
 
             # We can disable checks since we already validated schedulability.
             self._batch.insert_sequence(host_seq_desc, tokens, do_checks=do_checks)
+            if self._tracer:
+                self._tracer.add_sequence(host_seq_desc)
 
         # Send all metadata to the device
         self._batch.finalize()
@@ -295,4 +306,6 @@ class InferenceEngineV2:
             pickle.dump(self._model._config, open(os.path.join(save_path, "ds_model_config.pkl"), "wb"))
 
     def empty_run(self) -> None:
+        if self._tracer:
+            self._tracer.init_batch(is_empty_run=True, num_layers=self._model.num_layers)
         self._model.empty_run()

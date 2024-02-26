@@ -25,6 +25,7 @@ from ...interfaces import DSMoEBase, DSMoERegistry
 from ...configs import DSMoEConfig
 from ....kernels.cutlass_ops import MoEGEMM
 from ....inference_parameter import InferenceParameter
+from ....tracer import record
 
 
 @DSMoERegistry.register_module
@@ -306,18 +307,19 @@ class DSMultiGemmMoEEp(DSMoEBase):
         if self.expert_tp_degree > 1:
             send_expert_counts = send_expert_counts.repeat(self.expert_tp_degree, 1)
 
-        a2a_handle_1 = dist.all_to_all_single(
-            self._recv_expert_counts,
-            send_expert_counts,
-            async_op=True,
-            group=ep_group
-        )
-        # 2. First scatter tokens before communicating tokens.
-        if not empty_run:
-            self._moe_scatter(moe_input, self._expert_cumsum, mapped_slots, hidden_states, self._expert_counts,
-                            assignments, offsets)
+        with record("moe_a2a_1"):
+            a2a_handle_1 = dist.all_to_all_single(
+                self._recv_expert_counts,
+                send_expert_counts,
+                async_op=True,
+                group=ep_group
+            )
+            # 2. First scatter tokens before communicating tokens.
+            if not empty_run:
+                self._moe_scatter(moe_input, self._expert_cumsum, mapped_slots, hidden_states, self._expert_counts,
+                                assignments, offsets)
 
-        a2a_handle_1.wait()
+            a2a_handle_1.wait()
 
         # Repeat tokens for expert tensor parallelism
         recv_expert_counts_per_rank, send_expert_counts_per_rank, recv_expert_counts_max, total_recv_tokens = self._moe_summarize_recv_token_stat(
@@ -334,60 +336,63 @@ class DSMultiGemmMoEEp(DSMoEBase):
         repeated_moe_input = moe_input if self.expert_tp_degree == 1 else moe_input.repeat(self.expert_tp_degree, 1)
         shuffled_moe_input = self._shuffled_moe_input[:total_recv_tokens]
 
-        a2a_handle_2 = dist.all_to_all_single(
-            shuffled_moe_input,
-            repeated_moe_input,
-            output_split_sizes=recv_expert_counts_per_rank,
-            input_split_sizes=send_expert_counts_per_rank,
-            async_op=True,
-            group=ep_group
-        )
-
-        # 3. Prepare local permute. We need local permute as tokens from different ranks are grouped by experts in contiguous chunks.
-        if total_recv_tokens > 0:
-            local_assignments = self._local_assignments[:total_recv_tokens]
-            local_offsets = self._local_offsets[:total_recv_tokens]
-
-            self._moe_build_local_permute_mapping(
-                local_assignments,
-                local_offsets,
-                self._recv_expert_cumsum,
-                self._recv_per_expert_cumsum,
-                recv_expert_counts_max)
-
-        a2a_handle_2.wait()
-
-        if total_recv_tokens > 0:
-            local_scores = self._local_scores[:total_recv_tokens]
-            local_mapped_slots = self._local_mapped_slots[:total_recv_tokens]
-
-            permuted_moe_input = self._permuted_moe_input[:total_recv_tokens]
-            # 4. Do local permute on shuffled_moe_input.
-            self._moe_scatter(permuted_moe_input, self._local_expert_cumsum, local_mapped_slots, shuffled_moe_input, self._local_expert_counts,
-                            local_assignments, local_offsets)
-
-            # 5. Compute expert layers with permuted input.
-            permuted_output_unordered = self._run_mlp(
-                permuted_moe_input,
-                mlp_1_w,
-                mlp_2_w,
-                mlp_1_b,
-                mlp_2_b,
-                self._local_expert_cumsum
+        with record("moe_a2a_2"):
+            a2a_handle_2 = dist.all_to_all_single(
+                shuffled_moe_input,
+                repeated_moe_input,
+                output_split_sizes=recv_expert_counts_per_rank,
+                input_split_sizes=send_expert_counts_per_rank,
+                async_op=True,
+                group=ep_group
             )
 
-            # 6. Do local unpermute with permuted_output_unordered.
-            # We reuse shuffled_moe_input as an output buffer.
-            self._moe_gather(shuffled_moe_input, permuted_output_unordered, local_scores, local_mapped_slots, self._local_expert_counts)
+            # 3. Prepare local permute. We need local permute as tokens from different ranks are grouped by experts in contiguous chunks.
+            if total_recv_tokens > 0:
+                local_assignments = self._local_assignments[:total_recv_tokens]
+                local_offsets = self._local_offsets[:total_recv_tokens]
 
-        # 7. a2a back
-        dist.all_to_all_single(
-            repeated_moe_input,
-            shuffled_moe_input,
-            output_split_sizes=send_expert_counts_per_rank,
-            input_split_sizes=recv_expert_counts_per_rank,
-            group=ep_group
-        )
+                self._moe_build_local_permute_mapping(
+                    local_assignments,
+                    local_offsets,
+                    self._recv_expert_cumsum,
+                    self._recv_per_expert_cumsum,
+                    recv_expert_counts_max)
+
+            a2a_handle_2.wait()
+
+        with record("moe_ffn"):
+            if total_recv_tokens > 0:
+                    local_scores = self._local_scores[:total_recv_tokens]
+                    local_mapped_slots = self._local_mapped_slots[:total_recv_tokens]
+
+                    permuted_moe_input = self._permuted_moe_input[:total_recv_tokens]
+                    # 4. Do local permute on shuffled_moe_input.
+                    self._moe_scatter(permuted_moe_input, self._local_expert_cumsum, local_mapped_slots, shuffled_moe_input, self._local_expert_counts,
+                                    local_assignments, local_offsets)
+
+                    # 5. Compute expert layers with permuted input.
+                    permuted_output_unordered = self._run_mlp(
+                        permuted_moe_input,
+                        mlp_1_w,
+                        mlp_2_w,
+                        mlp_1_b,
+                        mlp_2_b,
+                        self._local_expert_cumsum
+                    )
+
+                    # 6. Do local unpermute with permuted_output_unordered.
+                    # We reuse shuffled_moe_input as an output buffer.
+                    self._moe_gather(shuffled_moe_input, permuted_output_unordered, local_scores, local_mapped_slots, self._local_expert_counts)
+
+        with record("moe_a2a_3"):
+            # 7. a2a back
+            dist.all_to_all_single(
+                repeated_moe_input,
+                shuffled_moe_input,
+                output_split_sizes=send_expert_counts_per_rank,
+                input_split_sizes=recv_expert_counts_per_rank,
+                group=ep_group
+            )
 
         if not empty_run:
             # 8. Sum repeated_moe_input for expert tensor parallelism.

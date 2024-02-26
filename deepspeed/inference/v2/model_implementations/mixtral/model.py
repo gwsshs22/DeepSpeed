@@ -17,6 +17,7 @@ from ...model_implementations import *
 from ...modules.configs import *
 from ...modules.interfaces import *
 from ...ragged import RaggedBatchWrapper
+from ...tracer import record
 from ..inference_model_base import (
     DSModelImplementationConfig,
     MPType,
@@ -202,34 +203,35 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
             ragged_batch_info (RaggedBatchWrapper): The batch metadata.
         """
         # TODO(cmikeh2): Distribute ragged_batch_info to all modules
+        with record("attn"):
+            cur_params = self._transformer[layer_idx]
+            kv_cache = self.state_manager.get_cache(layer_idx)
 
-        cur_params = self._transformer[layer_idx]
-        kv_cache = self.state_manager.get_cache(layer_idx)
+            hidden_states = self.qkv(hidden_states, cur_params.qkv_w)
+            hidden_states = self.attn(hidden_states, kv_cache, ragged_batch_info)
+            hidden_states = self.attn_out(hidden_states, cur_params.attn_out_w)
 
-        hidden_states = self.qkv(hidden_states, cur_params.qkv_w)
-        hidden_states = self.attn(hidden_states, kv_cache, ragged_batch_info)
-        hidden_states = self.attn_out(hidden_states, cur_params.attn_out_w)
+            if self.tp_size > 1:
+                dist.all_reduce(hidden_states, group=self._base_mp_group)
 
-        if self.tp_size > 1:
-            dist.all_reduce(hidden_states, group=self._base_mp_group)
+            residual, hidden_states = self.norm(residual, hidden_states, cur_params.mlp_norm_gamma)
 
-        residual, hidden_states = self.norm(residual, hidden_states, cur_params.mlp_norm_gamma)
+        with record("moe"):
+            hidden_states, assignments, scores = self.moe(hidden_states, ragged_batch_info, cur_params.moe_gate,
+                                                cur_params.moe_mlp_1, cur_params.moe_mlp_2)
 
-        hidden_states, assignments, scores = self.moe(hidden_states, ragged_batch_info, cur_params.moe_gate,
-                                              cur_params.moe_mlp_1, cur_params.moe_mlp_2)
+            if self.tp_size > 1:
+                dist.all_reduce(hidden_states, group=self._base_mp_group)
 
-        if self.tp_size > 1:
-            dist.all_reduce(hidden_states, group=self._base_mp_group)
+            if layer_idx != self.num_layers - 1:
+                next_params = self._transformer[layer_idx + 1]
+                residual, hidden_states = self.norm(residual, hidden_states, next_params.attn_norm_gamma)
+            else:
+                # On last layer, we just need to perform the residual add. Adding into the residual
+                # here is safe.
+                residual.add_(hidden_states)
 
-        if layer_idx != self.num_layers - 1:
-            next_params = self._transformer[layer_idx + 1]
-            residual, hidden_states = self.norm(residual, hidden_states, next_params.attn_norm_gamma)
-        else:
-            # On last layer, we just need to perform the residual add. Adding into the residual
-            # here is safe.
-            residual.add_(hidden_states)
-
-        return residual, hidden_states, assignments, scores
+            return residual, hidden_states, assignments, scores
 
     def _forward_unembed(self, hidden_states: torch.Tensor, ragged_batch_info: RaggedBatchWrapper) -> torch.Tensor:
         """
@@ -255,12 +257,12 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
 
     def forward(self, wrapped_batch: RaggedBatchWrapper) -> torch.Tensor:
 
-        residual = self._forward_embed(wrapped_batch)
+        with record("embed"):
+            residual = self._forward_embed(wrapped_batch)
+            residual, hidden_states = self.norm(residual, None, self._transformer[0].attn_norm_gamma, beta=None)
 
-        residual, hidden_states = self.norm(residual, None, self._transformer[0].attn_norm_gamma, beta=None)
-
-        expert_assignments = []
-        expert_scores = []
+            expert_assignments = []
+            expert_scores = []
 
         for layer_idx in range(self.num_layers):
             wrapped_batch.current_layer = layer_idx
@@ -269,12 +271,13 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
                 expert_assignments.append(assignments)
                 expert_scores.append(scores)
 
-        if self._collect_expert_dist:
-            return self._forward_unembed(residual, wrapped_batch), \
-                ProfilingResult(expert_assignments=expert_assignments,
-                                expert_scores=expert_scores)
-        else:
-            return self._forward_unembed(residual, wrapped_batch)
+        with record("unembed"):
+            if self._collect_expert_dist:
+                return self._forward_unembed(residual, wrapped_batch), \
+                    ProfilingResult(expert_assignments=expert_assignments,
+                                    expert_scores=expert_scores)
+            else:
+                return self._forward_unembed(residual, wrapped_batch)
 
     def empty_run(self) -> None:
         for layer_idx in range(self.num_layers):

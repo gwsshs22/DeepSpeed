@@ -45,3 +45,5 @@ class RaggedInferenceEngineConfig(DeepSpeedConfigModel):
     simulated_gating: bool = False
 
     simulated_gating_temperature: float = 1.0
+
+    trace_enabled: bool = False
