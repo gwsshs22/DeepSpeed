@@ -1,6 +1,6 @@
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, field, asdict
+from typing import Any, List
 
 import torch
 
@@ -14,17 +14,6 @@ class BatchTraceHolder:
     traces: Any = field(default_factory=list)
 
 @dataclass
-class BatchTraceSummary:
-    batch_id: int
-    is_empty_run: bool
-    num_layers: int
-    seen_tokens: Any
-    in_flight_tokens: Any
-    layer_exec_times: Any
-    embed: int
-    unembed: int
-
-@dataclass
 class LayerExecTime:
     attn: int = 0
     moe: int = 0
@@ -32,6 +21,18 @@ class LayerExecTime:
     moe_a2a_2: int = 0
     moe_ffn: int = 0
     moe_a2a_3: int = 0
+
+@dataclass
+class BatchTraceSummary:
+    batch_id: int
+    is_empty_run: bool
+    num_layers: int
+    seen_tokens: List[int]
+    in_flight_tokens: List[int]
+    record_names: List[str]
+    record_exec_times: Any
+    embed: int
+    unembed: int
 
 class Tracer:
 
@@ -63,13 +64,19 @@ class Tracer:
             embed = int(traces[0][1].elapsed_time(traces[0][2]) * 1000)
             unembed = int(traces[-1][1].elapsed_time(traces[-1][2]) * 1000)
             traces = traces[1:-1]
-        layer_exec_times = []
+        record_exec_times = []
         records_per_layer = len(traces) // batch_trace.num_layers
+        record_names = ["attn", "moe", "moe_a2a_1", "moe_a2a_2", "moe_ffn", "moe_a2a_3"]
+        record_names_map = {}
+        for i, n in enumerate(record_names):
+            record_names_map[n] = i
+
         for layer_idx in range(batch_trace.num_layers):
-            exec_time = LayerExecTime()
+            exec_time = [0, 0, 0, 0, 0, 0]
             for r in traces[layer_idx * records_per_layer:(layer_idx + 1) * records_per_layer]:
-                setattr(exec_time, r[0], int(r[1].elapsed_time(r[2]) * 1000))
-            layer_exec_times.append(layer_exec_times)
+                exec_time[record_names_map[r[0]]] = int(r[1].elapsed_time(r[2]) * 1000)
+
+            record_exec_times.append(exec_time)
 
         return BatchTraceSummary(
             batch_id=batch_trace.batch_id,
@@ -77,7 +84,8 @@ class Tracer:
             num_layers=batch_trace.num_layers,
             seen_tokens=batch_trace.seen_tokens,
             in_flight_tokens=batch_trace.in_flight_tokens,
-            layer_exec_times=layer_exec_times,
+            record_names=record_names,
+            record_exec_times=record_exec_times,
             embed=embed,
             unembed=unembed
         )
@@ -85,7 +93,6 @@ class Tracer:
     def batch_summaries(self):
         for t in self._batch_traces:
             yield self._summarize(t)
-        # return [self._summarize(t) for t in self._batch_traces]
 
 TRACER = None
 def set_tracer(tracer):

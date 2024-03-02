@@ -16,6 +16,8 @@ from transformers import MixtralForCausalLM, MixtralConfig
 
 import os
 import random
+from dataclasses import asdict
+import json
 
 class TestMoeExpertParallelism(DistributedTest):
     world_size = 4
@@ -182,4 +184,4 @@ class TestMoeExpertParallelism(DistributedTest):
     def test_mixtral_model_moe_ep_tracer(self, n_top_k, n_experts, max_seq_len):
         self._test_mixtral_model_moe_ep(n_top_k, n_experts, max_seq_len, num_layers=2, trace_enabled=True)
         for s in get_tracer().batch_summaries():
-            print(s)
+            print(json.dumps(asdict(s)))
