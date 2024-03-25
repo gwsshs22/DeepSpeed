@@ -16,7 +16,7 @@ class BatchTraceHolder:
 @dataclass
 class LayerExecTime:
     attn: int = 0
-    moe: int = 0
+    ffn: int = 0
     moe_a2a_1: int = 0
     moe_a2a_2: int = 0
     moe_ffn: int = 0
@@ -66,7 +66,7 @@ class Tracer:
             traces = traces[1:-1]
         record_exec_times = []
         records_per_layer = len(traces) // batch_trace.num_layers
-        record_names = ["attn", "moe", "moe_a2a_1", "moe_a2a_2", "moe_ffn", "moe_a2a_3"]
+        record_names = ["attn", "ffn", "moe_a2a_1", "moe_a2a_2", "moe_ffn", "moe_a2a_3"]
         record_names_map = {}
         for i, n in enumerate(record_names):
             record_names_map[n] = i

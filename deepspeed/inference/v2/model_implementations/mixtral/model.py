@@ -216,7 +216,7 @@ class MixtralInferenceModel(DSMoETransformerModelBase):
 
             residual, hidden_states = self.norm(residual, hidden_states, cur_params.mlp_norm_gamma)
 
-        with record("moe"):
+        with record("ffn"):
             hidden_states, assignments, scores = self.moe(hidden_states, ragged_batch_info, cur_params.moe_gate,
                                                 cur_params.moe_mlp_1, cur_params.moe_mlp_2)
 

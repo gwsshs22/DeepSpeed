@@ -15,9 +15,9 @@ from ...model_implementations import *
 from ...modules.configs import *
 from ...modules.interfaces import *
 from ...ragged import RaggedBatchWrapper
+from ...tracer import record
 
 from .container import MistralNonTransformerContainer, MistralTransformerContainer
-
 
 class MistralInferenceModel(DSTransformerModelBase):
     """
@@ -143,35 +143,35 @@ class MistralInferenceModel(DSTransformerModelBase):
             ragged_batch_info (RaggedBatchWrapper): The batch metadata.
         """
         # TODO(cmikeh2): Distribute ragged_batch_info to all modules
+        with record("attn"):
+            cur_params = self._transformer[layer_idx]
+            kv_cache = self.state_manager.get_cache(layer_idx)
 
-        cur_params = self._transformer[layer_idx]
-        kv_cache = self.state_manager.get_cache(layer_idx)
+            hidden_states = self.qkv(hidden_states, cur_params.qkv_w, b=None)
+            hidden_states = self.attn(hidden_states, kv_cache, ragged_batch_info)
+            hidden_states = self.attn_out(hidden_states, cur_params.attn_out_w, b=None)
 
-        hidden_states = self.qkv(hidden_states, cur_params.qkv_w, b=None)
-        hidden_states = self.attn(hidden_states, kv_cache, ragged_batch_info)
-        hidden_states = self.attn_out(hidden_states, cur_params.attn_out_w, b=None)
+            if self.tp_size > 1:
+                dist.all_reduce(hidden_states, group=self._base_mp_group)
 
-        if self.tp_size > 1:
-            dist.all_reduce(hidden_states, group=self._base_mp_group)
+            residual, hidden_states = self.norm(residual, hidden_states, cur_params.mlp_norm_gamma, beta=None)
+        with record("ffn"):
+            # Should be configurable in the future
+            hidden_states = self.mlp_1(hidden_states, cur_params.mlp_1_w, b=None)
+            hidden_states = self.mlp_2(hidden_states, cur_params.mlp_2_w, b=None)
 
-        residual, hidden_states = self.norm(residual, hidden_states, cur_params.mlp_norm_gamma, beta=None)
+            if self.tp_size > 1:
+                dist.all_reduce(hidden_states, group=self._base_mp_group)
 
-        # Should be configurable in the future
-        hidden_states = self.mlp_1(hidden_states, cur_params.mlp_1_w, b=None)
-        hidden_states = self.mlp_2(hidden_states, cur_params.mlp_2_w, b=None)
+            if layer_idx != self.num_layers - 1:
+                next_params = self._transformer[layer_idx + 1]
+                residual, hidden_states = self.norm(residual, hidden_states, next_params.attn_norm_gamma, beta=None)
+            else:
+                # On last layer, we just need to perform the residual add. Adding into the residual
+                # here is safe.
+                residual.add_(hidden_states)
 
-        if self.tp_size > 1:
-            dist.all_reduce(hidden_states, group=self._base_mp_group)
-
-        if layer_idx != self.num_layers - 1:
-            next_params = self._transformer[layer_idx + 1]
-            residual, hidden_states = self.norm(residual, hidden_states, next_params.attn_norm_gamma, beta=None)
-        else:
-            # On last layer, we just need to perform the residual add. Adding into the residual
-            # here is safe.
-            residual.add_(hidden_states)
-
-        return residual, hidden_states
+            return residual, hidden_states
 
     def _forward_unembed(self, hidden_states: torch.Tensor, ragged_batch_info: RaggedBatchWrapper) -> torch.Tensor:
         """
@@ -196,12 +196,13 @@ class MistralInferenceModel(DSTransformerModelBase):
             return logits
 
     def forward(self, wrapped_batch: RaggedBatchWrapper) -> torch.Tensor:
+        with record("embed"):
+            residual = self._forward_embed(wrapped_batch)
 
-        residual = self._forward_embed(wrapped_batch)
-
-        residual, hidden_states = self.norm(residual, None, self._transformer[0].attn_norm_gamma, beta=None)
+            residual, hidden_states = self.norm(residual, None, self._transformer[0].attn_norm_gamma, beta=None)
 
         for layer_idx in range(self.num_layers):
             residual, hidden_states = self._forward_transformer(layer_idx, residual, hidden_states, wrapped_batch)
 
-        return self._forward_unembed(residual, wrapped_batch)
+        with record("unembed"):
+            return self._forward_unembed(residual, wrapped_batch)
